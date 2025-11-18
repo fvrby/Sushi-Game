@@ -1,1164 +1,906 @@
--- main.lua - Juego estilo Vampire Survivors con gatito
+--[[
+    main.lua - Game Entry Point
+    
+    Sushi Survivors
+    Un survivors-like donde un gatito sobrevive oleadas de cubos rojos.
+    
+    Arquitectura:
+    - State Machine para flujo de juego
+    - Object Pooling para entidades
+    - Spatial Hashing para colisiones
+    
+    Controles:
+    - WASD/Flechas: Mover
+    - Mouse: Apuntar
+    - Disparo automático
+    - R: Reiniciar (en game over)
+    - ESC: Menú/Salir
+    - M: Toggle música
+    - F6: Toggle shader CRT
+]]
 
-function love.load()
-    love.window.setTitle("🍣 Sushi Survivors")
-    love.mouse.setVisible(true)
-    
-    -- Fuentes
-    catFont = love.graphics.newFont(40)
-    uiFont = love.graphics.newFont(16)
-    titleFont = love.graphics.newFont(64)
-    subtitleFont = love.graphics.newFont(24)
-    
-    -- Cargar música
-    music = nil
-    local musicFiles = {"Sushi_Game_OST_Armageddon.mp3", "Sushi_Game_OST_Armageddon.ogg", "Sushi_Game_OST_Armageddon.wav"}
-    
-    for _, filename in ipairs(musicFiles) do
-        local success, audio = pcall(love.audio.newSource, filename, "stream")
-        if success then
-            music = audio
-            music:setLooping(true)
-            music:setVolume(0.6)
-            break
+-- =============================================================================
+-- REQUIRES
+-- =============================================================================
+local Constants = require("src.core.constants")
+local GameState = require("src.core.game_state")
+local Input = require("src.core.input")
+local Pool = require("src.core.pool")
+
+local Player = require("src.entities.player")
+local Bullet = require("src.entities.bullet")
+local Enemy = require("src.entities.enemy")
+local Particle = require("src.entities.particle")
+
+local Spawner = require("src.systems.spawner")
+local Collision = require("src.systems.collision")
+local Audio = require("src.core.audio")
+local UI = require("src.ui.ui_components")
+local CRTShader = require("src.rendering.crt_shader")
+
+-- =============================================================================
+-- GAME VARIABLES
+-- =============================================================================
+local player
+local bulletPool
+local enemyPool
+local particlePool
+local spawner
+local collision
+local crtShader
+
+local score = 0
+local gameTime = 0
+
+-- UI Elements
+local menuButtons = {}
+local settingsSliders = {}
+local settingsButtons = {}
+
+-- Debug
+local debugFlags = {
+    showFPS = false,
+    showEntities = false,
+    showHitboxes = false,
+    showGrid = false,
+    showSpawns = false,
+}
+
+-- Fuentes
+local fonts = {}
+
+-- =============================================================================
+-- HELPER FUNCTIONS
+-- =============================================================================
+
+local function spawnParticles(x, y, count, color, speedMin, speedMax)
+    for i = 1, count do
+        local particle = particlePool:get()
+        if particle then
+            local angle = love.math.random() * math.pi * 2
+            local speed = love.math.random(speedMin, speedMax)
+            local vx = math.cos(angle) * speed
+            local vy = math.sin(angle) * speed
+            local lifetime = love.math.random() * 
+                (Constants.PARTICLE_LIFETIME_MAX - Constants.PARTICLE_LIFETIME_MIN) + 
+                Constants.PARTICLE_LIFETIME_MIN
+            
+            particle:activate(x, y, vx, vy, color, lifetime)
         end
     end
+end
+
+local function resetGame()
+    -- Reset player
+    player:reset()
     
-    -- Si no se encontró ningún archivo de audio compatible
-    if not music then
-        print("Advertencia: No se pudo cargar la música. Formatos soportados: .mp3, .ogg, .wav")
-        print("Love2D no soporta archivos .mp4 para audio. Por favor convierte tu archivo a .mp3 u .ogg")
-    end
+    -- Liberar todas las entidades
+    bulletPool:releaseAll()
+    enemyPool:releaseAll()
+    particlePool:releaseAll()
     
-    -- Efectos de sonido
-    sounds = {}
+    -- Reset spawner
+    spawner:reset()
     
-    -- Cargar sonido de disparo
-    local success, snd = pcall(love.audio.newSource, "pistol-shot.wav", "static")
-    if success then
-        sounds.shoot = snd
-        sounds.shoot:setVolume(0.3)
-        print("Sonido de disparo cargado")
-    else
-        print("No se pudo cargar pistol-shot.wav")
-        sounds.shoot = nil
-    end
-    
-    -- Cargar sonido de explosión
-    success, snd = pcall(love.audio.newSource, "Synthetic-explosion.wav", "static")
-    if success then
-        sounds.explosion = snd
-        sounds.explosion:setVolume(0.4)
-        print("Sonido de explosión cargado")
-    else
-        print("No se pudo cargar Synthetic-explosion.wav")
-        sounds.explosion = nil
-    end
-    
-    -- Cargar sprites
-    sprites = {}
-    -- Intentar cargar el sprite del jugador
-    local success, img = pcall(love.graphics.newImage, "cat.png")
-    if success then
-        sprites.player = img
-    else
-        -- Si no existe la imagen, usaremos un sprite dibujado
-        sprites.player = nil
-    end
-    
-    -- Cargar sprite del enemigo si existe
-    success, img = pcall(love.graphics.newImage, "enemy.png")
-    if success then
-        sprites.enemy = img
-    else
-        sprites.enemy = nil
-    end
-    
-    -- Estado del juego
-    gameState = "menu" -- menu, playing, gameover, settings
+    -- Reset score y tiempo
     score = 0
-    musicPlaying = false
+    gameTime = 0
+end
+
+-- =============================================================================
+-- LÖVE CALLBACKS
+-- =============================================================================
+
+function love.load()
+    -- Seed random
+    love.math.setRandomSeed(os.time())
     
-    -- Iniciar música inmediatamente
-    if music then
-        music:play()
-        musicPlaying = true
+    -- Configuración de gráficos
+    love.graphics.setBackgroundColor(Constants.COLOR_BACKGROUND)
+    love.graphics.setDefaultFilter("nearest", "nearest")  -- Pixel art crisp
+
+    -- Crear fuentes
+    fonts.small = love.graphics.newFont(14)
+    fonts.medium = love.graphics.newFont(20)
+    fonts.large = love.graphics.newFont(32)
+    fonts.title = love.graphics.newFont(48)
+    
+    -- Crear entidades
+    player = Player:new()
+    
+    -- Crear pools
+    bulletPool = Pool:new(Bullet, Constants.BULLET_POOL_SIZE)
+    enemyPool = Pool:new(Enemy, Constants.ENEMY_POOL_SIZE)
+    particlePool = Pool:new(Particle, Constants.PARTICLE_POOL_SIZE)
+    
+    -- Crear sistemas
+    spawner = Spawner:new(enemyPool)
+    collision = Collision:new()
+    
+    -- Configurar callbacks de colisión
+    collision.onEnemyHit = function(enemy, bullet)
+        -- Partículas de impacto
+        local cx, cy = enemy:getCenter()
+        spawnParticles(
+            cx, cy,
+            Constants.PARTICLE_HIT_COUNT,
+            Constants.COLOR_PARTICLE_HIT,
+            Constants.PARTICLE_SPEED_MIN / 2,
+            Constants.PARTICLE_SPEED_MAX / 2
+        )
     end
     
-    -- Inicializar jugador
-    initPlayer()
-    
-    -- Enemigos
-    enemies = {}
-    enemySpawnTimer = 0
-    enemySpawnRate = 1.0 -- segundos entre spawns
-    
-    -- Balas
-    bullets = {}
-    shootTimer = 0
-    shootRate = 0.3 -- segundos entre disparos
-    
-    -- Partículas
-    particles = {}
-    
-    -- Efecto CRT
-    crtTime = 0
-    local success, shader = pcall(function()
-        return love.graphics.newShader([[
-            extern number time;
-            extern vec2 resolution;
-            
-            vec4 effect(vec4 color, Image texture, vec2 tc, vec2 pc) {
-                vec2 uv = tc;
-                
-                float scanline = sin(uv.y * resolution.y * 1.5) * 0.04;
-                
-                vec2 curved = uv * 2.0 - 1.0;
-                curved *= 1.0 + 0.05 * (curved.x * curved.x + curved.y * curved.y);
-                curved = (curved + 1.0) * 0.5;
-                
-                float vignette = 1.0 - length(curved - 0.5) * 0.8;
-                
-                vec4 col = Texel(texture, curved);
-                float distortion = 0.002;
-                col.r = Texel(texture, curved + vec2(distortion, 0.0)).r;
-                col.b = Texel(texture, curved - vec2(distortion, 0.0)).b;
-                
-                float flicker = 0.98 + 0.02 * sin(time * 20.0);
-                
-                col.rgb *= (1.0 - scanline) * vignette * flicker;
-                
-                if (curved.x < 0.0 || curved.x > 1.0 || curved.y < 0.0 || curved.y > 1.0) {
-                    col = vec4(0.0, 0.0, 0.0, 1.0);
-                }
-                
-                return col * color;
-            }
-        ]])
-    end)
-    
-    if success then
-        crtShader = shader
-        crtShader:send("resolution", {love.graphics.getWidth(), love.graphics.getHeight()})
+    collision.onEnemyKilled = function(enemy)
+        -- Partículas de muerte
+        local cx, cy = enemy:getCenter()
+        spawnParticles(
+            cx, cy,
+            Constants.PARTICLE_DEATH_COUNT,
+            Constants.COLOR_PARTICLE_DEATH,
+            Constants.PARTICLE_SPEED_MIN,
+            Constants.PARTICLE_SPEED_MAX
+        )
+        
+        -- Score
+        score = score + Constants.SCORE_PER_KILL
+        
+        -- Sonido
+        Audio:playSFX("explosion")
     end
     
-    canvas = love.graphics.newCanvas()
+    collision.onPlayerHit = function(enemy)
+        player:die()
+        GameState:switch("gameover")
+    end
     
-    -- Botón de inicio
-    startButton = {
-        x = 0,
-        y = 0,
-        width = 200,
-        height = 60,
-        text = "INICIAR",
-        hovered = false
+    -- Registrar estados
+    registerStates()
+    
+    -- Inicializar audio
+    Audio:init()
+    Audio:playMusic("main")
+    
+    -- Crear UI de menú
+    createMenuUI()
+    createSettingsUI()
+    
+    -- Crear shader CRT
+    crtShader = CRTShader:new()
+    
+    -- Iniciar en menú
+    GameState:switch("menu")
+end
+
+-- =============================================================================
+-- UI CREATION
+-- =============================================================================
+
+function createMenuUI()
+    local centerX = Constants.WINDOW_WIDTH / 2
+    local buttonW = 200
+    local buttonH = 50
+    
+    menuButtons = {
+        UI.Button:new(
+            centerX - buttonW / 2, 350,
+            buttonW, buttonH,
+            "INICIAR",
+            function()
+                resetGame()
+                GameState:switch("playing")
+            end,
+            Constants.COLOR_UI_PRIMARY
+        ),
+        UI.Button:new(
+            centerX - buttonW / 2, 420,
+            buttonW, buttonH,
+            "CONFIGURACION",
+            function()
+                GameState:switch("settings")
+            end,
+            Constants.COLOR_UI_SECONDARY
+        ),
+        UI.Button:new(
+            centerX - buttonW / 2, 490,
+            buttonW, buttonH,
+            "SALIR",
+            function()
+                love.event.quit()
+            end,
+            {0.5, 0.5, 0.5}
+        )
+    }
+end
+
+function createSettingsUI()
+    local centerX = Constants.WINDOW_WIDTH / 2
+    local sliderW = 300
+    local startY = 280
+    local spacing = 80
+    
+    local musicVol, shootVol, explosionVol = Audio:getVolumes()
+    
+    settingsSliders = {
+        UI.Slider:new(
+            centerX - sliderW / 2, startY,
+            sliderW,
+            "Volumen de Musica",
+            musicVol,
+            function(value)
+                Audio:setMusicVolume(value)
+            end,
+            Constants.COLOR_UI_SECONDARY
+        ),
+        UI.Slider:new(
+            centerX - sliderW / 2, startY + spacing,
+            sliderW,
+            "Volumen de Disparos",
+            shootVol,
+            function(value)
+                Audio:setShootVolume(value)
+                Audio:playTestSound("shoot")
+            end,
+            {1, 0.8, 0.2}  -- Amarillo
+        ),
+        UI.Slider:new(
+            centerX - sliderW / 2, startY + spacing * 2,
+            sliderW,
+            "Volumen de Explosiones",
+            explosionVol,
+            function(value)
+                Audio:setExplosionVolume(value)
+                Audio:playTestSound("explosion")
+            end,
+            {1, 0.3, 0.3}  -- Rojo
+        )
     }
     
-    -- Botón de configuración
-    settingsButton = {
-        x = 0,
-        y = 0,
-        width = 200,
-        height = 60,
-        text = "CONFIGURACIÓN",
-        hovered = false
+    settingsButtons = {
+        UI.Button:new(
+            centerX - 100, startY + spacing * 3 + 20,
+            200, 50,
+            "VOLVER",
+            function()
+                GameState:switch("menu")
+            end,
+            {0.5, 0.5, 0.5}
+        )
     }
-    
-    -- Centrar los botones
-    startButton.x = love.graphics.getWidth()/2 - startButton.width/2
-    startButton.y = love.graphics.getHeight()/2 + 30
-    
-    settingsButton.x = love.graphics.getWidth()/2 - settingsButton.width/2
-    settingsButton.y = love.graphics.getHeight()/2 + 110
-    
-    -- Configuración de volumen
-    volumeSlider = {
-        x = 0,
-        y = 0,
-        width = 300,
-        height = 20,
-        value = 0.6, -- 60% volumen inicial
-        dragging = false
-    }
-    
-    volumeSlider.x = love.graphics.getWidth()/2 - volumeSlider.width/2
-    volumeSlider.y = love.graphics.getHeight()/2 + 20
-    
-    -- Slider de efectos de sonido - Disparos
-    shootSlider = {
-        x = 0,
-        y = 0,
-        width = 300,
-        height = 20,
-        value = 0.15, -- 15% volumen inicial para disparos
-        dragging = false
-    }
-    
-    shootSlider.x = love.graphics.getWidth()/2 - shootSlider.width/2
-    shootSlider.y = love.graphics.getHeight()/2 + 100
-    
-    -- Slider de efectos de sonido - Explosiones
-    explosionSlider = {
-        x = 0,
-        y = 0,
-        width = 300,
-        height = 20,
-        value = 0.15, -- 15% volumen inicial para explosiones
-        dragging = false
-    }
-    
-    explosionSlider.x = love.graphics.getWidth()/2 - explosionSlider.width/2
-    explosionSlider.y = love.graphics.getHeight()/2 + 180
-    
-    -- Aplicar volumen inicial a los efectos
-    if sounds.shoot then sounds.shoot:setVolume(shootSlider.value) end
-    if sounds.explosion then sounds.explosion:setVolume(explosionSlider.value) end
-    
-    -- Botón de volver
-    backButton = {
-        x = 0,
-        y = 0,
-        width = 150,
-        height = 50,
-        text = "VOLVER",
-        hovered = false
-    }
-    
-    backButton.x = love.graphics.getWidth()/2 - backButton.width/2
-    backButton.y = love.graphics.getHeight()/2 + 260
 end
 
 function love.update(dt)
-    crtTime = crtTime + dt
+    -- Cap delta time para evitar saltos grandes
+    dt = math.min(dt, 1/30)
     
-    if gameState == "menu" then
-        -- Verificar hover del botón de inicio
-        local mx, my = love.mouse.getPosition()
-        startButton.hovered = mx >= startButton.x and mx <= startButton.x + startButton.width and
-                              my >= startButton.y and my <= startButton.y + startButton.height
-        
-        -- Verificar hover del botón de configuración
-        settingsButton.hovered = mx >= settingsButton.x and mx <= settingsButton.x + settingsButton.width and
-                                 my >= settingsButton.y and my <= settingsButton.y + settingsButton.height
-    
-    elseif gameState == "settings" then
-        -- Verificar hover del slider y botón de volver
-        local mx, my = love.mouse.getPosition()
-        
-        -- Arrastrar slider de música
-        if volumeSlider.dragging then
-            local newValue = (mx - volumeSlider.x) / volumeSlider.width
-            volumeSlider.value = math.max(0, math.min(1, newValue))
-            if music then
-                music:setVolume(volumeSlider.value)
-            end
-        end
-        
-        -- Arrastrar slider de disparos
-        if shootSlider.dragging then
-            local newValue = (mx - shootSlider.x) / shootSlider.width
-            shootSlider.value = math.max(0, math.min(1, newValue))
-            if sounds.shoot then sounds.shoot:setVolume(shootSlider.value) end
-        end
-        
-        -- Arrastrar slider de explosiones
-        if explosionSlider.dragging then
-            local newValue = (mx - explosionSlider.x) / explosionSlider.width
-            explosionSlider.value = math.max(0, math.min(1, newValue))
-            if sounds.explosion then sounds.explosion:setVolume(explosionSlider.value) end
-        end
-        
-        -- Hover del botón volver
-        backButton.hovered = mx >= backButton.x and mx <= backButton.x + backButton.width and
-                            my >= backButton.y and my <= backButton.y + backButton.height
-    
-    elseif gameState == "playing" then
-        
-        -- Actualizar jugador
-        updatePlayer(dt)
-        
-        -- Spawn enemigos
-        enemySpawnTimer = enemySpawnTimer + dt
-        if enemySpawnTimer >= enemySpawnRate then
-            enemySpawnTimer = 0
-            spawnEnemy()
-            -- Aumentar dificultad gradualmente
-            enemySpawnRate = math.max(0.2, enemySpawnRate - 0.01)
-        end
-        
-        -- Actualizar enemigos
-        for i = #enemies, 1, -1 do
-            updateEnemy(enemies[i], dt)
-            
-            -- Colisión con jugador
-            if checkCollision(player, enemies[i]) then
-                gameState = "gameover"
-            end
-            
-            -- Eliminar enemigos muertos
-            if enemies[i].dead then
-                table.remove(enemies, i)
-            end
-        end
-        
-        -- Disparar automáticamente
-        shootTimer = shootTimer + dt
-        if shootTimer >= shootRate then
-            shootTimer = 0
-            local mouseX, mouseY = love.mouse.getPosition()
-            shootBullet(player.x + player.size/2, player.y + player.size/2, mouseX, mouseY)
-            
-            -- Reproducir sonido de disparo
-            if sounds.shoot then
-                sounds.shoot:stop() -- Detener si ya está sonando
-                sounds.shoot:play()
-            end
-        end
-        
-        -- Actualizar balas
-        for i = #bullets, 1, -1 do
-            updateBullet(bullets[i], dt)
-            
-            -- Colisión con enemigos
-            for j = #enemies, 1, -1 do
-                if not enemies[j].dead and checkCollision(bullets[i], enemies[j]) then
-                    enemies[j].health = enemies[j].health - 1
-                    bullets[i].dead = true
-                    
-                    if enemies[j].health <= 0 then
-                        enemies[j].dead = true
-                        score = score + 10
-                        createExplosion(enemies[j].x + enemies[j].size/2, 
-                                      enemies[j].y + enemies[j].size/2, 15)
-                        
-                        -- Reproducir sonido de explosión
-                        if sounds.explosion then
-                            -- Clonar el sonido para que múltiples explosiones suenen simultáneamente
-                            sounds.explosion:clone():play()
-                        end
-                    else
-                        createExplosion(bullets[i].x, bullets[i].y, 5)
-                    end
-                    break
-                end
-            end
-            
-            if bullets[i].dead then
-                table.remove(bullets, i)
-            end
-        end
-        
-        -- Actualizar partículas
-        updateParticles(dt)
-    end
+    GameState:update(dt)
 end
 
 function love.draw()
-    love.graphics.setCanvas(canvas)
-    love.graphics.clear()
-    
-    if gameState == "menu" then
-        drawMenu()
-    elseif gameState == "settings" then
-        drawSettings()
-    elseif gameState == "playing" then
-        drawGame()
-    elseif gameState == "gameover" then
-        drawGameOver()
+    -- Comenzar render al canvas del shader
+    if crtShader then
+        crtShader:beginDraw()
     end
     
-    love.graphics.setCanvas()
+    -- Dibujar estado actual
+    GameState:draw()
+    
+    -- Debug overlay
+    drawDebugOverlay()
     
     -- Aplicar shader CRT
     if crtShader then
-        crtShader:send("time", crtTime)
-        love.graphics.setShader(crtShader)
+        crtShader:endDraw()
     end
-    
-    love.graphics.setColor(1, 1, 1)
-    love.graphics.draw(canvas, 0, 0)
-    love.graphics.setShader()
 end
 
-function drawMenu()
-    local width = love.graphics.getWidth()
-    local height = love.graphics.getHeight()
-    
-    -- Fondo oscuro con grid
-    love.graphics.setColor(0.05, 0.05, 0.1)
-    love.graphics.rectangle("fill", 0, 0, width, height)
-    
-    -- Grid animado
-    love.graphics.setColor(0.1, 0.1, 0.15, 0.3)
-    local offset = (crtTime * 20) % 50
-    for x = -50 + offset, width, 50 do
-        love.graphics.line(x, 0, x, height)
+function love.keypressed(key, scancode, isrepeat)
+    -- Debug toggles (siempre activos)
+    if Input:isAction(key, "debugFPS") then
+        debugFlags.showFPS = not debugFlags.showFPS
+    elseif Input:isAction(key, "debugEntities") then
+        debugFlags.showEntities = not debugFlags.showEntities
+    elseif Input:isAction(key, "debugHitboxes") then
+        debugFlags.showHitboxes = not debugFlags.showHitboxes
+    elseif Input:isAction(key, "debugGrid") then
+        debugFlags.showGrid = not debugFlags.showGrid
+    elseif Input:isAction(key, "debugSpawns") then
+        debugFlags.showSpawns = not debugFlags.showSpawns
+    elseif Input:isAction(key, "toggleCRT") then
+        if crtShader then
+            crtShader:toggle()
+        end
     end
-    for y = -50 + offset, height, 50 do
-        love.graphics.line(0, y, width, y)
-    end
     
-    -- Título principal
-    love.graphics.setFont(titleFont)
-    love.graphics.setColor(1, 0.3, 0.5)
-    local title = "SUSHI SURVIVORS"
-    local titleWidth = titleFont:getWidth(title)
-    
-    -- Sombra del título
-    love.graphics.setColor(0, 0, 0, 0.5)
-    love.graphics.print(title, width/2 - titleWidth/2 + 3, height/2 - 120 + 3)
-    
-    -- Título con efecto de parpadeo
-    local flicker = 0.9 + 0.1 * math.sin(crtTime * 3)
-    love.graphics.setColor(1 * flicker, 0.3 * flicker, 0.5 * flicker)
-    love.graphics.print(title, width/2 - titleWidth/2, height/2 - 120)
-    
-    -- Emoji de sushi
-    love.graphics.setFont(catFont)
-    love.graphics.setColor(1, 1, 1)
-    love.graphics.print("🍣", width/2 - 60, height/2 - 60)
-    love.graphics.print("🐱", width/2 + 20, height/2 - 60)
-    
-    -- Subtítulo
-    love.graphics.setFont(subtitleFont)
-    love.graphics.setColor(0.7, 0.7, 0.7)
-    local subtitle = "Sobrevive a la invasión de cubos rojos"
-    local subtitleWidth = subtitleFont:getWidth(subtitle)
-    love.graphics.print(subtitle, width/2 - subtitleWidth/2, height/2 - 10)
-    
-    -- Botón de inicio
-    if startButton.hovered then
-        love.graphics.setColor(1, 0.4, 0.6, 0.9)
-    else
-        love.graphics.setColor(0.8, 0.2, 0.4, 0.7)
-    end
-    love.graphics.rectangle("fill", startButton.x, startButton.y, startButton.width, startButton.height)
-    
-    -- Borde del botón inicio
-    if startButton.hovered then
-        love.graphics.setColor(1, 0.6, 0.8)
-        love.graphics.setLineWidth(3)
-    else
-        love.graphics.setColor(1, 0.3, 0.5)
-        love.graphics.setLineWidth(2)
-    end
-    love.graphics.rectangle("line", startButton.x, startButton.y, startButton.width, startButton.height)
-    love.graphics.setLineWidth(1)
-    
-    -- Texto del botón inicio
-    love.graphics.setFont(subtitleFont)
-    love.graphics.setColor(1, 1, 1)
-    local btnTextWidth = subtitleFont:getWidth(startButton.text)
-    love.graphics.print(startButton.text, 
-                       startButton.x + startButton.width/2 - btnTextWidth/2, 
-                       startButton.y + startButton.height/2 - subtitleFont:getHeight()/2)
-    
-    -- Botón de configuración
-    if settingsButton.hovered then
-        love.graphics.setColor(0.4, 0.6, 1, 0.9)
-    else
-        love.graphics.setColor(0.2, 0.4, 0.8, 0.7)
-    end
-    love.graphics.rectangle("fill", settingsButton.x, settingsButton.y, settingsButton.width, settingsButton.height)
-    
-    -- Borde del botón configuración
-    if settingsButton.hovered then
-        love.graphics.setColor(0.6, 0.8, 1)
-        love.graphics.setLineWidth(3)
-    else
-        love.graphics.setColor(0.3, 0.5, 1)
-        love.graphics.setLineWidth(2)
-    end
-    love.graphics.rectangle("line", settingsButton.x, settingsButton.y, settingsButton.width, settingsButton.height)
-    love.graphics.setLineWidth(1)
-    
-    -- Texto del botón configuración
-    love.graphics.setFont(uiFont)
-    love.graphics.setColor(1, 1, 1)
-    btnTextWidth = uiFont:getWidth(settingsButton.text)
-    love.graphics.print(settingsButton.text, 
-                       settingsButton.x + settingsButton.width/2 - btnTextWidth/2, 
-                       settingsButton.y + settingsButton.height/2 - uiFont:getHeight()/2)
-    
-    -- Instrucciones
-    love.graphics.setFont(uiFont)
-    love.graphics.setColor(0.5, 0.5, 0.5)
-    local instructions = "Click para comenzar tu aventura"
-    local instWidth = uiFont:getWidth(instructions)
-    love.graphics.print(instructions, width/2 - instWidth/2, height - 50)
+    GameState:keypressed(key, scancode, isrepeat)
 end
 
-function drawSettings()
-    local width = love.graphics.getWidth()
-    local height = love.graphics.getHeight()
-    
-    -- Fondo oscuro con grid
-    love.graphics.setColor(0.05, 0.05, 0.1)
-    love.graphics.rectangle("fill", 0, 0, width, height)
-    
-    -- Grid
-    love.graphics.setColor(0.1, 0.1, 0.15, 0.3)
-    local offset = (crtTime * 20) % 50
-    for x = -50 + offset, width, 50 do
-        love.graphics.line(x, 0, x, height)
-    end
-    for y = -50 + offset, height, 50 do
-        love.graphics.line(0, y, width, y)
-    end
-    
-    -- Panel central (más grande)
-    love.graphics.setColor(0.1, 0.1, 0.15, 0.9)
-    love.graphics.rectangle("fill", width/2 - 300, height/2 - 250, 600, 550)
-    love.graphics.setColor(0.4, 0.6, 1)
-    love.graphics.setLineWidth(3)
-    love.graphics.rectangle("line", width/2 - 300, height/2 - 250, 600, 550)
-    love.graphics.setLineWidth(1)
-    
-    -- Título
-    love.graphics.setFont(titleFont)
-    love.graphics.setColor(0.6, 0.8, 1)
-    local title = "CONFIGURACIÓN"
-    local titleWidth = titleFont:getWidth(title)
-    love.graphics.print(title, width/2 - titleWidth/2, height/2 - 200, 0, 0.7, 0.7)
-    
-    -- Sección de volumen
-    love.graphics.setFont(subtitleFont)
-    love.graphics.setColor(1, 1, 1)
-    local volumeText = "VOLUMEN DE MÚSICA"
-    local volumeTextWidth = subtitleFont:getWidth(volumeText)
-    love.graphics.print(volumeText, width/2 - volumeTextWidth/2, height/2 - 50)
-    
-    -- Slider de volumen - Fondo
-    love.graphics.setColor(0.2, 0.2, 0.25)
-    love.graphics.rectangle("fill", volumeSlider.x, volumeSlider.y, volumeSlider.width, volumeSlider.height)
-    
-    -- Slider - Barra llena
-    love.graphics.setColor(0.4, 0.6, 1)
-    love.graphics.rectangle("fill", volumeSlider.x, volumeSlider.y, 
-                           volumeSlider.width * volumeSlider.value, volumeSlider.height)
-    
-    -- Slider - Borde
-    love.graphics.setColor(0.6, 0.8, 1)
-    love.graphics.rectangle("line", volumeSlider.x, volumeSlider.y, volumeSlider.width, volumeSlider.height)
-    
-    -- Slider - Handle (círculo)
-    local handleX = volumeSlider.x + volumeSlider.width * volumeSlider.value
-    love.graphics.setColor(1, 1, 1)
-    love.graphics.circle("fill", handleX, volumeSlider.y + volumeSlider.height/2, 12)
-    love.graphics.setColor(0.6, 0.8, 1)
-    love.graphics.circle("line", handleX, volumeSlider.y + volumeSlider.height/2, 12)
-    
-    -- Porcentaje de volumen
-    love.graphics.setFont(uiFont)
-    love.graphics.setColor(0.2, 1, 0.3)
-    local percentText = math.floor(volumeSlider.value * 100) .. "%"
-    local percentWidth = uiFont:getWidth(percentText)
-    love.graphics.print(percentText, width/2 - percentWidth/2, volumeSlider.y + 35)
-    
-    -- Sección de disparos
-    love.graphics.setFont(subtitleFont)
-    love.graphics.setColor(1, 1, 1)
-    local shootText = "VOLUMEN DISPAROS"
-    local shootTextWidth = subtitleFont:getWidth(shootText)
-    love.graphics.print(shootText, width/2 - shootTextWidth/2, shootSlider.y - 35)
-    
-    -- Slider de disparos - Fondo
-    love.graphics.setColor(0.2, 0.2, 0.25)
-    love.graphics.rectangle("fill", shootSlider.x, shootSlider.y, shootSlider.width, shootSlider.height)
-    
-    -- Slider - Barra llena
-    love.graphics.setColor(1, 0.8, 0.2)
-    love.graphics.rectangle("fill", shootSlider.x, shootSlider.y, 
-                           shootSlider.width * shootSlider.value, shootSlider.height)
-    
-    -- Slider - Borde
-    love.graphics.setColor(1, 0.9, 0.4)
-    love.graphics.rectangle("line", shootSlider.x, shootSlider.y, shootSlider.width, shootSlider.height)
-    
-    -- Slider - Handle (círculo)
-    local handleX2 = shootSlider.x + shootSlider.width * shootSlider.value
-    love.graphics.setColor(1, 1, 1)
-    love.graphics.circle("fill", handleX2, shootSlider.y + shootSlider.height/2, 12)
-    love.graphics.setColor(1, 0.9, 0.4)
-    love.graphics.circle("line", handleX2, shootSlider.y + shootSlider.height/2, 12)
-    
-    -- Porcentaje de volumen disparos
-    love.graphics.setFont(uiFont)
-    love.graphics.setColor(1, 0.8, 0.2)
-    percentText = math.floor(shootSlider.value * 100) .. "%"
-    percentWidth = uiFont:getWidth(percentText)
-    love.graphics.print(percentText, width/2 - percentWidth/2, shootSlider.y + 35)
-    
-    -- Sección de explosiones
-    love.graphics.setFont(subtitleFont)
-    love.graphics.setColor(1, 1, 1)
-    local explosionText = "VOLUMEN EXPLOSIONES"
-    local explosionTextWidth = subtitleFont:getWidth(explosionText)
-    love.graphics.print(explosionText, width/2 - explosionTextWidth/2, explosionSlider.y - 35)
-    
-    -- Slider de explosiones - Fondo
-    love.graphics.setColor(0.2, 0.2, 0.25)
-    love.graphics.rectangle("fill", explosionSlider.x, explosionSlider.y, explosionSlider.width, explosionSlider.height)
-    
-    -- Slider - Barra llena
-    love.graphics.setColor(1, 0.3, 0.2)
-    love.graphics.rectangle("fill", explosionSlider.x, explosionSlider.y, 
-                           explosionSlider.width * explosionSlider.value, explosionSlider.height)
-    
-    -- Slider - Borde
-    love.graphics.setColor(1, 0.5, 0.4)
-    love.graphics.rectangle("line", explosionSlider.x, explosionSlider.y, explosionSlider.width, explosionSlider.height)
-    
-    -- Slider - Handle (círculo)
-    local handleX3 = explosionSlider.x + explosionSlider.width * explosionSlider.value
-    love.graphics.setColor(1, 1, 1)
-    love.graphics.circle("fill", handleX3, explosionSlider.y + explosionSlider.height/2, 12)
-    love.graphics.setColor(1, 0.5, 0.4)
-    love.graphics.circle("line", handleX3, explosionSlider.y + explosionSlider.height/2, 12)
-    
-    -- Porcentaje de volumen explosiones
-    love.graphics.setFont(uiFont)
-    love.graphics.setColor(1, 0.3, 0.2)
-    percentText = math.floor(explosionSlider.value * 100) .. "%"
-    percentWidth = uiFont:getWidth(percentText)
-    love.graphics.print(percentText, width/2 - percentWidth/2, explosionSlider.y + 35)
-    
-    -- Estado de la música
-    if music and musicPlaying then
-        love.graphics.setColor(0.3, 1, 0.3)
-        love.graphics.print("♪ Música reproduciéndose", width/2 - 90, height/2 - 130)
-    elseif music then
-        love.graphics.setColor(1, 0.5, 0.3)
-        love.graphics.print("♪ Música en pausa", width/2 - 70, height/2 - 130)
-    else
-        love.graphics.setColor(1, 0.3, 0.3)
-        love.graphics.print("⚠ No se pudo cargar la música", width/2 - 110, height/2 - 130)
-    end
-    
-    -- Botón de volver
-    if backButton.hovered then
-        love.graphics.setColor(1, 0.4, 0.6, 0.9)
-    else
-        love.graphics.setColor(0.8, 0.2, 0.4, 0.7)
-    end
-    love.graphics.rectangle("fill", backButton.x, backButton.y, backButton.width, backButton.height)
-    
-    if backButton.hovered then
-        love.graphics.setColor(1, 0.6, 0.8)
-        love.graphics.setLineWidth(3)
-    else
-        love.graphics.setColor(1, 0.3, 0.5)
-        love.graphics.setLineWidth(2)
-    end
-    love.graphics.rectangle("line", backButton.x, backButton.y, backButton.width, backButton.height)
-    love.graphics.setLineWidth(1)
-    
-    love.graphics.setFont(subtitleFont)
-    love.graphics.setColor(1, 1, 1)
-    local backTextWidth = subtitleFont:getWidth(backButton.text)
-    love.graphics.print(backButton.text, 
-                       backButton.x + backButton.width/2 - backTextWidth/2, 
-                       backButton.y + backButton.height/2 - subtitleFont:getHeight()/2)
+function love.keyreleased(key, scancode)
+    GameState:keyreleased(key, scancode)
 end
 
-function drawGame()
-    love.mouse.setVisible(false)
-    -- Fondo con grid
-    love.graphics.setColor(0.05, 0.05, 0.1)
-    love.graphics.rectangle("fill", 0, 0, love.graphics.getWidth(), love.graphics.getHeight())
-    
-    -- Grid
-    love.graphics.setColor(0.1, 0.1, 0.15, 0.5)
-    for x = 0, love.graphics.getWidth(), 50 do
-        love.graphics.line(x, 0, x, love.graphics.getHeight())
-    end
-    for y = 0, love.graphics.getHeight(), 50 do
-        love.graphics.line(0, y, love.graphics.getWidth(), y)
-    end
-    
-    -- Partículas (fondo)
-    drawParticles()
-    
-    -- Enemigos
-    for _, enemy in ipairs(enemies) do
-        drawEnemy(enemy)
-    end
-    
-    -- Balas
-    for _, bullet in ipairs(bullets) do
-        drawBullet(bullet)
-    end
-    
-    -- Jugador
-    drawPlayer()
-    
-    -- Cursor personalizado
-    local mx, my = love.mouse.getPosition()
-    love.graphics.setColor(1, 0, 0)
-    love.graphics.circle("line", mx, my, 8, 16)
-    love.graphics.line(mx - 12, my, mx - 5, my)
-    love.graphics.line(mx + 12, my, mx + 5, my)
-    love.graphics.line(mx, my - 12, mx, my - 5)
-    love.graphics.line(mx, my + 12, mx, my + 5)
-    
-    -- UI
-    love.graphics.setFont(uiFont)
-    love.graphics.setColor(0.2, 1, 0.3)
-    love.graphics.print("PUNTOS: " .. score, 10, 10, 0, 1.5, 1.5)
-    love.graphics.setColor(1, 1, 1, 0.8)
-    love.graphics.print("WASD: Mover | Mouse: Apuntar", 10, 40)
-    love.graphics.setColor(1, 0.3, 0.3)
-    love.graphics.print("Enemigos: " .. #enemies, 10, 60)
+function love.mousepressed(x, y, button, istouch, presses)
+    GameState:mousepressed(x, y, button, istouch, presses)
 end
 
-function drawGameOver()
-    -- Fondo oscuro
-    love.graphics.setColor(0.05, 0.05, 0.1)
-    love.graphics.rectangle("fill", 0, 0, love.graphics.getWidth(), love.graphics.getHeight())
-    
-    local width = love.graphics.getWidth()
-    local height = love.graphics.getHeight()
-    
-    -- Panel central
-    love.graphics.setColor(0.1, 0.1, 0.15, 0.9)
-    love.graphics.rectangle("fill", width/2 - 250, height/2 - 150, 500, 300)
-    love.graphics.setColor(1, 0.2, 0.2)
-    love.graphics.setLineWidth(3)
-    love.graphics.rectangle("line", width/2 - 250, height/2 - 150, 500, 300)
-    love.graphics.setLineWidth(1)
-    
-    -- Texto GAME OVER
-    love.graphics.setFont(titleFont)
-    love.graphics.setColor(1, 0.2, 0.2)
-    local text = "GAME OVER"
-    local textWidth = titleFont:getWidth(text)
-    love.graphics.print(text, width/2 - textWidth/2, height/2 - 100)
-    
-    -- Puntuación
-    love.graphics.setFont(subtitleFont)
-    love.graphics.setColor(0.2, 1, 0.3)
-    text = "PUNTUACIÓN FINAL: " .. score
-    textWidth = subtitleFont:getWidth(text)
-    love.graphics.print(text, width/2 - textWidth/2, height/2 - 20)
-    
-    -- Instrucciones
-    love.graphics.setFont(uiFont)
-    love.graphics.setColor(0.7, 0.7, 0.7)
-    text = "Presiona R para reiniciar"
-    textWidth = uiFont:getWidth(text)
-    love.graphics.print(text, width/2 - textWidth/2, height/2 + 50)
-    
-    text = "Presiona ESC para salir"
-    textWidth = uiFont:getWidth(text)
-    love.graphics.print(text, width/2 - textWidth/2, height/2 + 75)
+function love.mousereleased(x, y, button, istouch, presses)
+    GameState:mousereleased(x, y, button, istouch, presses)
 end
 
-function love.keypressed(key)
-    if key == "escape" then
-        if gameState == "menu" then
-            love.event.quit()
-        else
-            gameState = "menu"
+function love.mousemoved(x, y, dx, dy, istouch)
+    GameState:mousemoved(x, y, dx, dy, istouch)
+end
+
+-- =============================================================================
+-- STATE DEFINITIONS
+-- =============================================================================
+
+function registerStates()
+    -- =========================================================================
+    -- MENU STATE
+    -- =========================================================================
+    GameState:register("menu", {
+        enter = function(self)
             love.mouse.setVisible(true)
-        end
-    end
-    
-    if key == "r" then
-        if gameState == "gameover" then
-            startGame()
-        end
-    end
-    
-    -- Toggle música con M
-    if key == "m" and music then
-        if musicPlaying then
-            music:pause()
-            musicPlaying = false
-        else
-            music:play()
-            musicPlaying = true
-        end
-    end
-end
-
-function love.mousepressed(x, y, button)
-    if button == 1 then -- Click izquierdo
-        if gameState == "menu" then
-            -- Verificar click directo en los botones (sin depender de hover)
-            if x >= startButton.x and x <= startButton.x + startButton.width and
-               y >= startButton.y and y <= startButton.y + startButton.height then
-                startGame()
+        end,
+        
+        update = function(self, dt)
+            local mx, my = love.mouse.getPosition()
+            for _, button in ipairs(menuButtons) do
+                button:update(mx, my)
+            end
+        end,
+        
+        draw = function(self)
+            -- Fondo con grid
+            drawBackgroundGrid()
+            
+            -- Título con efecto
+            local time = love.timer.getTime()
+            local pulse = 0.8 + 0.2 * math.sin(time * 3)
+            
+            love.graphics.setFont(fonts.title)
+            love.graphics.setColor(
+                Constants.COLOR_UI_PRIMARY[1] * pulse,
+                Constants.COLOR_UI_PRIMARY[2] * pulse,
+                Constants.COLOR_UI_PRIMARY[3] * pulse,
+                1
+            )
+            
+            local title = "SUSHI SURVIVORS"
+            local titleWidth = fonts.title:getWidth(title)
+            love.graphics.print(
+                title,
+                Constants.WINDOW_WIDTH / 2 - titleWidth / 2,
+                120
+            )
+            
+            -- Subtítulo
+            love.graphics.setFont(fonts.medium)
+            love.graphics.setColor(1, 1, 1, 0.7)
+            local subtitle = "Sobrevive a la invasion de cubos rojos"
+            local subWidth = fonts.medium:getWidth(subtitle)
+            love.graphics.print(
+                subtitle,
+                Constants.WINDOW_WIDTH / 2 - subWidth / 2,
+                185
+            )
+            
+            -- Botones
+            for _, button in ipairs(menuButtons) do
+                button:draw()
             end
             
-            if x >= settingsButton.x and x <= settingsButton.x + settingsButton.width and
-               y >= settingsButton.y and y <= settingsButton.y + settingsButton.height then
-                gameState = "settings"
+            -- Controles
+            love.graphics.setFont(fonts.small)
+            love.graphics.setColor(1, 1, 1, 0.4)
+            local controls = "WASD: Mover | Mouse: Apuntar | M: Musica | F6: CRT"
+            local ctrlWidth = fonts.small:getWidth(controls)
+            love.graphics.print(
+                controls,
+                Constants.WINDOW_WIDTH / 2 - ctrlWidth / 2,
+                Constants.WINDOW_HEIGHT - 50
+            )
+            
+            -- Estado de música
+            local musicStatus = Audio:isMusicPlaying() and "Music ON" or "Music OFF"
+            love.graphics.setColor(Audio:isMusicPlaying() and {0.5, 1, 0.5, 0.7} or {1, 0.5, 0.5, 0.7})
+            love.graphics.print(musicStatus, 10, Constants.WINDOW_HEIGHT - 30)
+            
+            love.graphics.setColor(1, 1, 1, 1)
+        end,
+        
+        keypressed = function(self, key)
+            if Input:isAction(key, "confirm") then
+                resetGame()
+                GameState:switch("playing")
+            elseif Input:isAction(key, "cancel") then
+                love.event.quit()
+            elseif Input:isAction(key, "toggleMusic") then
+                Audio:toggleMusic()
+            end
+        end,
+        
+        mousepressed = function(self, x, y, button)
+            for _, btn in ipairs(menuButtons) do
+                btn:click(x, y, button)
+            end
+        end,
+    })
+    
+    -- =========================================================================
+    -- SETTINGS STATE
+    -- =========================================================================
+    GameState:register("settings", {
+        enter = function(self)
+            love.mouse.setVisible(true)
+            -- Actualizar valores de sliders por si cambiaron
+            local musicVol, shootVol, explosionVol = Audio:getVolumes()
+            settingsSliders[1]:setValue(musicVol)
+            settingsSliders[2]:setValue(shootVol)
+            settingsSliders[3]:setValue(explosionVol)
+        end,
+        
+        update = function(self, dt)
+            local mx, my = love.mouse.getPosition()
+            
+            for _, slider in ipairs(settingsSliders) do
+                slider:update(mx, my)
             end
             
-        elseif gameState == "settings" then
-            -- Verificar click en slider de música
-            if y >= volumeSlider.y and y <= volumeSlider.y + volumeSlider.height and
-               x >= volumeSlider.x and x <= volumeSlider.x + volumeSlider.width then
-                volumeSlider.dragging = true
-                local newValue = (x - volumeSlider.x) / volumeSlider.width
-                volumeSlider.value = math.max(0, math.min(1, newValue))
-                if music then
-                    music:setVolume(volumeSlider.value)
+            for _, button in ipairs(settingsButtons) do
+                button:update(mx, my)
+            end
+        end,
+        
+        draw = function(self)
+            -- Fondo
+            drawBackgroundGrid()
+            
+            -- Panel
+            local panelW = 500
+            local panelH = 400
+            local panelX = (Constants.WINDOW_WIDTH - panelW) / 2
+            local panelY = (Constants.WINDOW_HEIGHT - panelH) / 2
+            
+            -- Fondo del panel
+            love.graphics.setColor(0.1, 0.1, 0.15, 0.95)
+            love.graphics.rectangle("fill", panelX, panelY, panelW, panelH, 8, 8)
+            
+            -- Borde
+            love.graphics.setColor(Constants.COLOR_UI_SECONDARY)
+            love.graphics.setLineWidth(3)
+            love.graphics.rectangle("line", panelX, panelY, panelW, panelH, 8, 8)
+            love.graphics.setLineWidth(1)
+            
+            -- Título
+            love.graphics.setColor(1, 1, 1, 1)
+            local font = love.graphics.getFont()
+            local title = "CONFIGURACION"
+            local titleWidth = font:getWidth(title)
+            love.graphics.print(title, 
+                Constants.WINDOW_WIDTH / 2 - titleWidth / 2, 
+                panelY + 30)
+            
+            -- Estado de música
+            local musicStatus = Audio:isMusicPlaying() and "Musica: Reproduciendo" or "Musica: Pausada"
+            love.graphics.setColor(Audio:isMusicPlaying() and {0.5, 1, 0.5, 0.8} or {1, 0.5, 0.5, 0.8})
+            local statusWidth = font:getWidth(musicStatus)
+            love.graphics.print(musicStatus,
+                Constants.WINDOW_WIDTH / 2 - statusWidth / 2,
+                panelY + 60)
+            
+            -- Sliders
+            for _, slider in ipairs(settingsSliders) do
+                slider:draw()
+            end
+            
+            -- Botones
+            for _, button in ipairs(settingsButtons) do
+                button:draw()
+            end
+            
+            -- Instrucción
+            love.graphics.setColor(1, 1, 1, 0.4)
+            local hint = "Presiona M para pausar/reanudar musica"
+            local hintWidth = font:getWidth(hint)
+            love.graphics.print(hint,
+                Constants.WINDOW_WIDTH / 2 - hintWidth / 2,
+                panelY + panelH - 40)
+            
+            love.graphics.setColor(1, 1, 1, 1)
+        end,
+        
+        keypressed = function(self, key)
+            if Input:isAction(key, "cancel") then
+                GameState:switch("menu")
+            elseif Input:isAction(key, "toggleMusic") then
+                Audio:toggleMusic()
+            end
+        end,
+        
+        mousepressed = function(self, x, y, button)
+            for _, slider in ipairs(settingsSliders) do
+                slider:mousePressed(x, y, button)
+            end
+            
+            for _, btn in ipairs(settingsButtons) do
+                btn:click(x, y, button)
+            end
+        end,
+        
+        mousereleased = function(self, x, y, button)
+            for _, slider in ipairs(settingsSliders) do
+                slider:mouseReleased()
+            end
+        end,
+    })
+    
+    -- =========================================================================
+    -- PLAYING STATE
+    -- =========================================================================
+    GameState:register("playing", {
+        enter = function(self)
+            love.mouse.setVisible(false)
+        end,
+        
+        update = function(self, dt)
+            gameTime = gameTime + dt
+            
+            -- Update player
+            local shouldFire = player:update(dt)
+            
+            -- Disparar
+            if shouldFire then
+                local bullet = bulletPool:get()
+                if bullet then
+                    local x, y, dx, dy = player:getFireData()
+                    bullet:activate(x, y, dx, dy)
+                    Audio:playSFX("shoot")
                 end
             end
             
-            -- Verificar click en slider de disparos
-            if y >= shootSlider.y and y <= shootSlider.y + shootSlider.height and
-               x >= shootSlider.x and x <= shootSlider.x + shootSlider.width then
-                shootSlider.dragging = true
-                local newValue = (x - shootSlider.x) / shootSlider.width
-                shootSlider.value = math.max(0, math.min(1, newValue))
-                if sounds.shoot then 
-                    sounds.shoot:setVolume(shootSlider.value)
-                    -- Reproducir sonido de prueba
-                    sounds.shoot:clone():play()
+            -- Spawn enemies
+            spawner:update(dt)
+            
+            -- Update enemies
+            for _, enemy in enemyPool:iterateActive() do
+                enemy:update(dt, player.x, player.y)
+            end
+            
+            -- Update bullets
+            for _, bullet in bulletPool:iterateActive() do
+                if not bullet:update(dt) then
+                    bulletPool:release(bullet)
                 end
             end
             
-            -- Verificar click en slider de explosiones
-            if y >= explosionSlider.y and y <= explosionSlider.y + explosionSlider.height and
-               x >= explosionSlider.x and x <= explosionSlider.x + explosionSlider.width then
-                explosionSlider.dragging = true
-                local newValue = (x - explosionSlider.x) / explosionSlider.width
-                explosionSlider.value = math.max(0, math.min(1, newValue))
-                if sounds.explosion then 
-                    sounds.explosion:setVolume(explosionSlider.value)
-                    -- Reproducir sonido de prueba
-                    sounds.explosion:clone():play()
+            -- Update particles
+            for _, particle in particlePool:iterateActive() do
+                if not particle:update(dt) then
+                    particlePool:release(particle)
                 end
             end
             
-            -- Click en botón volver (verificación directa)
-            if x >= backButton.x and x <= backButton.x + backButton.width and
-               y >= backButton.y and y <= backButton.y + backButton.height then
-                gameState = "menu"
+            -- Collision detection
+            collision:update(player, bulletPool, enemyPool)
+        end,
+        
+        draw = function(self)
+            -- Background grid
+            drawBackgroundGrid()
+            
+            -- Particles (behind everything)
+            for _, particle in particlePool:iterateActive() do
+                particle:draw()
             end
-        end
-    end
-end
-
-function love.mousereleased(x, y, button)
-    if button == 1 then
-        volumeSlider.dragging = false
-        shootSlider.dragging = false
-        explosionSlider.dragging = false
-    end
-end
-
-function startGame()
-    gameState = "playing"
-    score = 0
-    enemies = {}
-    bullets = {}
-    particles = {}
-    enemySpawnTimer = 0
-    enemySpawnRate = 1.0
-    shootTimer = 0
-    initPlayer()
-    love.mouse.setVisible(false)
-end
-
--- ========================================
--- player.lua (integrado)
--- ========================================
-
-function initPlayer()
-    player = {
-        x = love.graphics.getWidth() / 2,
-        y = love.graphics.getHeight() / 2,
-        size = 40,
-        speed = 250
-    }
-end
-
-function updatePlayer(dt)
-    local dx, dy = 0, 0
+            
+            -- Enemies
+            for _, enemy in enemyPool:iterateActive() do
+                enemy:draw()
+                if debugFlags.showHitboxes then
+                    enemy:drawDebug()
+                end
+            end
+            
+            -- Bullets
+            for _, bullet in bulletPool:iterateActive() do
+                bullet:draw()
+                if debugFlags.showHitboxes then
+                    bullet:drawDebug()
+                end
+            end
+            
+            -- Player
+            player:draw()
+            if debugFlags.showHitboxes then
+                player:drawDebug()
+            end
+            
+            -- Debug visuals
+            if debugFlags.showGrid then
+                collision:drawDebug()
+            end
+            
+            if debugFlags.showSpawns then
+                spawner:drawDebug()
+            end
+            
+            -- HUD
+            drawHUD()
+            
+            -- Crosshair cursor
+            drawCrosshair()
+        end,
+        
+        keypressed = function(self, key)
+            if Input:isAction(key, "cancel") then
+                GameState:switch("menu")
+            elseif Input:isAction(key, "toggleMusic") then
+                Audio:toggleMusic()
+            end
+        end,
+    })
     
-    if love.keyboard.isDown("w") or love.keyboard.isDown("up") then
-        dy = dy - 1
-    end
-    if love.keyboard.isDown("s") or love.keyboard.isDown("down") then
-        dy = dy + 1
-    end
-    if love.keyboard.isDown("a") or love.keyboard.isDown("left") then
-        dx = dx - 1
-    end
-    if love.keyboard.isDown("d") or love.keyboard.isDown("right") then
-        dx = dx + 1
-    end
-    
-    -- Normalizar diagonal
-    local length = math.sqrt(dx * dx + dy * dy)
-    if length > 0 then
-        dx = dx / length
-        dy = dy / length
-    end
-    
-    player.x = player.x + dx * player.speed * dt
-    player.y = player.y + dy * player.speed * dt
-    
-    -- Límites del mapa
-    player.x = math.max(0, math.min(player.x, love.graphics.getWidth() - player.size))
-    player.y = math.max(0, math.min(player.y, love.graphics.getHeight() - player.size))
-end
-
-function drawPlayer()
-    love.graphics.setColor(1, 1, 1)
-    
-    local mouseX = love.mouse.getX()
-    local facingLeft = mouseX < player.x + player.size/2
-    
-    if sprites.player then
-        -- Si tenemos sprite, dibujarlo
-        local scaleX = player.size / sprites.player:getWidth()
-        local scaleY = player.size / sprites.player:getHeight()
+    -- =========================================================================
+    -- GAME OVER STATE
+    -- =========================================================================
+    GameState:register("gameover", {
+        enter = function(self)
+            love.mouse.setVisible(true)
+        end,
         
-        if facingLeft then
-            -- Voltear horizontalmente
-            love.graphics.draw(sprites.player, 
-                player.x + player.size/2, 
-                player.y + player.size/2, 
-                0, -scaleX, scaleY, 
-                sprites.player:getWidth()/2, 
-                sprites.player:getHeight()/2)
-        else
-            love.graphics.draw(sprites.player, 
-                player.x + player.size/2, 
-                player.y + player.size/2, 
-                0, scaleX, scaleY, 
-                sprites.player:getWidth()/2, 
-                sprites.player:getHeight()/2)
-        end
-    else
-        -- Si no hay sprite, dibujar un gatito con formas geométricas
-        love.graphics.push()
-        love.graphics.translate(player.x + player.size/2, player.y + player.size/2)
+        draw = function(self)
+            -- Dibujar el juego de fondo (congelado)
+            drawBackgroundGrid()
+            
+            for _, particle in particlePool:iterateActive() do
+                particle:draw()
+            end
+            
+            for _, enemy in enemyPool:iterateActive() do
+                enemy:draw()
+            end
+            
+            for _, bullet in bulletPool:iterateActive() do
+                bullet:draw()
+            end
+            
+            -- Overlay oscuro
+            love.graphics.setColor(0, 0, 0, 0.75)
+            love.graphics.rectangle("fill", 0, 0, 
+                Constants.WINDOW_WIDTH, Constants.WINDOW_HEIGHT)
+            
+            -- Panel de game over
+            local panelW = 450
+            local panelH = 220
+            local panelX = (Constants.WINDOW_WIDTH - panelW) / 2
+            local panelY = (Constants.WINDOW_HEIGHT - panelH) / 2
+            
+            -- Fondo del panel
+            love.graphics.setColor(0.08, 0.08, 0.1, 0.95)
+            love.graphics.rectangle("fill", panelX, panelY, panelW, panelH, 8, 8)
+            
+            -- Borde
+            love.graphics.setColor(1, 0.2, 0.2, 0.8)
+            love.graphics.setLineWidth(3)
+            love.graphics.rectangle("line", panelX, panelY, panelW, panelH, 8, 8)
+            love.graphics.setLineWidth(1)
+            
+            -- GAME OVER
+            love.graphics.setFont(fonts.title)
+            love.graphics.setColor(0, 0, 0, 0.5)
+            local goText = "GAME OVER"
+            local goWidth = fonts.title:getWidth(goText)
+            love.graphics.print(goText, 
+                Constants.WINDOW_WIDTH / 2 - goWidth / 2 + 2, 
+                panelY + 25 + 2)
+            love.graphics.setColor(1, 0.2, 0.2, 1)
+            love.graphics.print(goText, 
+                Constants.WINDOW_WIDTH / 2 - goWidth / 2, 
+                panelY + 25)
+            
+            -- Score
+            love.graphics.setFont(fonts.large)
+            love.graphics.setColor(0, 0, 0, 0.5)
+            local scoreText = "PUNTUACION FINAL: " .. score
+            local scoreWidth = fonts.large:getWidth(scoreText)
+            love.graphics.print(scoreText, 
+                Constants.WINDOW_WIDTH / 2 - scoreWidth / 2 + 2, 
+                panelY + 85 + 2)
+            love.graphics.setColor(Constants.COLOR_SCORE)
+            love.graphics.print(scoreText, 
+                Constants.WINDOW_WIDTH / 2 - scoreWidth / 2, 
+                panelY + 85)
+            
+            -- Instrucciones
+            love.graphics.setFont(fonts.medium)
+            love.graphics.setColor(1, 1, 1, 0.8)
+            local restart = "Presiona R para reiniciar"
+            local restartWidth = fonts.medium:getWidth(restart)
+            love.graphics.print(restart, 
+                Constants.WINDOW_WIDTH / 2 - restartWidth / 2, 
+                panelY + 140)
+            
+            love.graphics.setColor(1, 1, 1, 0.5)
+            local quit = "Presiona ESC para volver al menu"
+            local quitWidth = fonts.medium:getWidth(quit)
+            love.graphics.print(quit, 
+                Constants.WINDOW_WIDTH / 2 - quitWidth / 2, 
+                panelY + 170)
+            
+            love.graphics.setColor(1, 1, 1, 1)
+        end,
         
-        -- Voltear si mira a la izquierda
-        if facingLeft then
-            love.graphics.scale(-1, 1)
-        end
-        
-        -- Cuerpo (naranja)
-        love.graphics.setColor(1, 0.6, 0.2)
-        love.graphics.ellipse("fill", 0, 0, player.size/2.5, player.size/2.5)
-        
-        -- Cabeza
-        love.graphics.circle("fill", -5, -8, player.size/4)
-        
-        -- Orejas
-        love.graphics.setColor(1, 0.5, 0.1)
-        love.graphics.polygon("fill", -10, -15, -5, -10, -8, -18)
-        love.graphics.polygon("fill", 0, -15, -5, -10, -2, -18)
-        
-        -- Ojos
-        love.graphics.setColor(0, 0, 0)
-        love.graphics.circle("fill", -8, -10, 2)
-        love.graphics.circle("fill", -2, -10, 2)
-        
-        -- Brillo en los ojos
-        love.graphics.setColor(1, 1, 1)
-        love.graphics.circle("fill", -7.5, -10.5, 1)
-        love.graphics.circle("fill", -1.5, -10.5, 1)
-        
-        -- Nariz
-        love.graphics.setColor(1, 0.4, 0.4)
-        love.graphics.circle("fill", -5, -7, 1.5)
-        
-        -- Bigotes
-        love.graphics.setColor(0, 0, 0)
-        love.graphics.setLineWidth(1)
-        love.graphics.line(-12, -8, -18, -9)
-        love.graphics.line(-12, -6, -18, -6)
-        love.graphics.line(2, -8, 8, -9)
-        love.graphics.line(2, -6, 8, -6)
-        
-        -- Cola
-        love.graphics.setColor(1, 0.6, 0.2)
-        love.graphics.setLineWidth(3)
-        love.graphics.arc("line", "open", 10, 5, 8, -math.pi/4, math.pi/4)
-        
-        love.graphics.pop()
-    end
-end
-
--- ========================================
--- enemy.lua (integrado)
--- ========================================
-
-function spawnEnemy()
-    local enemy = {
-        x = 0,
-        y = 0,
-        size = 30,
-        speed = 80 + math.random(40),
-        health = 2,
-        dead = false
-    }
-    
-    -- Spawn desde un lado aleatorio
-    local side = math.random(4)
-    if side == 1 then -- Arriba
-        enemy.x = math.random(0, love.graphics.getWidth())
-        enemy.y = -enemy.size
-    elseif side == 2 then -- Derecha
-        enemy.x = love.graphics.getWidth()
-        enemy.y = math.random(0, love.graphics.getHeight())
-    elseif side == 3 then -- Abajo
-        enemy.x = math.random(0, love.graphics.getWidth())
-        enemy.y = love.graphics.getHeight()
-    else -- Izquierda
-        enemy.x = -enemy.size
-        enemy.y = math.random(0, love.graphics.getHeight())
-    end
-    
-    table.insert(enemies, enemy)
-end
-
-function updateEnemy(enemy, dt)
-    -- Perseguir al jugador
-    local dx = (player.x + player.size/2) - (enemy.x + enemy.size/2)
-    local dy = (player.y + player.size/2) - (enemy.y + enemy.size/2)
-    local length = math.sqrt(dx * dx + dy * dy)
-    
-    if length > 0 then
-        dx = dx / length
-        dy = dy / length
-    end
-    
-    enemy.x = enemy.x + dx * enemy.speed * dt
-    enemy.y = enemy.y + dy * enemy.speed * dt
-end
-
-function drawEnemy(enemy)
-    if sprites.enemy then
-        -- Si tenemos sprite de enemigo
-        love.graphics.setColor(1, 1, 1)
-        local scaleX = enemy.size / sprites.enemy:getWidth()
-        local scaleY = enemy.size / sprites.enemy:getHeight()
-        
-        love.graphics.draw(sprites.enemy, 
-            enemy.x + enemy.size/2, 
-            enemy.y + enemy.size/2, 
-            0, scaleX, scaleY, 
-            sprites.enemy:getWidth()/2, 
-            sprites.enemy:getHeight()/2)
-    else
-        -- Dibujar enemigo con formas
-        love.graphics.setColor(0.8, 0.1, 0.1)
-        love.graphics.rectangle("fill", enemy.x, enemy.y, enemy.size, enemy.size)
-        
-        love.graphics.setColor(1, 0.3, 0.3, 0.5)
-        love.graphics.rectangle("fill", enemy.x + 3, enemy.y + 3, enemy.size - 6, enemy.size - 6)
-        
-        love.graphics.setColor(1, 0.2, 0.2)
-        love.graphics.rectangle("line", enemy.x, enemy.y, enemy.size, enemy.size)
-    end
-end
-
--- ========================================
--- bullet.lua (integrado)
--- ========================================
-
-function shootBullet(x, y, targetX, targetY)
-    local dx = targetX - x
-    local dy = targetY - y
-    local length = math.sqrt(dx * dx + dy * dy)
-    
-    if length > 0 then
-        dx = dx / length
-        dy = dy / length
-    end
-    
-    table.insert(bullets, {
-        x = x,
-        y = y,
-        vx = dx * 500,
-        vy = dy * 500,
-        size = 8,
-        dead = false
+        keypressed = function(self, key)
+            if Input:isAction(key, "restart") then
+                resetGame()
+                GameState:switch("playing")
+            elseif Input:isAction(key, "cancel") then
+                GameState:switch("menu")
+            end
+        end,
     })
 end
 
-function updateBullet(bullet, dt)
-    bullet.x = bullet.x + bullet.vx * dt
-    bullet.y = bullet.y + bullet.vy * dt
+-- =============================================================================
+-- DRAWING HELPERS
+-- =============================================================================
+
+function drawBackgroundGrid()
+    love.graphics.setColor(0.1, 0.1, 0.15, 0.5)
     
-    -- Eliminar si sale de la pantalla
-    if bullet.x < -50 or bullet.x > love.graphics.getWidth() + 50 or
-       bullet.y < -50 or bullet.y > love.graphics.getHeight() + 50 then
-        bullet.dead = true
+    local gridSize = 40
+    
+    for x = 0, Constants.WINDOW_WIDTH, gridSize do
+        love.graphics.line(x, 0, x, Constants.WINDOW_HEIGHT)
     end
-end
-
-function drawBullet(bullet)
-    love.graphics.setColor(1, 1, 0)
-    love.graphics.circle("fill", bullet.x, bullet.y, bullet.size)
-    love.graphics.setColor(1, 1, 0.5, 0.5)
-    love.graphics.circle("fill", bullet.x, bullet.y, bullet.size - 2)
-end
-
--- ========================================
--- particle.lua (integrado)
--- ========================================
-
-function createExplosion(x, y, count)
-    for i = 1, count do
-        local angle = math.random() * math.pi * 2
-        local speed = 50 + math.random() * 150
-        table.insert(particles, {
-            x = x,
-            y = y,
-            vx = math.cos(angle) * speed,
-            vy = math.sin(angle) * speed,
-            size = 2 + math.random() * 4,
-            life = 0.5 + math.random() * 0.5,
-            maxLife = 1.0,
-            alpha = 1.0,
-            r = 0.8 + math.random() * 0.2,
-            g = 0.2 + math.random() * 0.3,
-            b = 0.1
-        })
+    
+    for y = 0, Constants.WINDOW_HEIGHT, gridSize do
+        love.graphics.line(0, y, Constants.WINDOW_WIDTH, y)
     end
+    
+    love.graphics.setColor(1, 1, 1, 1)
 end
 
-function updateParticles(dt)
-    for i = #particles, 1, -1 do
-        local p = particles[i]
-        p.x = p.x + p.vx * dt
-        p.y = p.y + p.vy * dt
-        p.vy = p.vy + 200 * dt -- Gravedad leve
-        p.life = p.life - dt
-        p.alpha = p.life / p.maxLife
+function drawHUD()
+    love.graphics.setFont(fonts.medium)
+    
+    -- Score con sombra
+    love.graphics.setColor(0, 0, 0, 0.8)
+    love.graphics.print("SCORE: " .. score, 12, 12)
+    love.graphics.setColor(Constants.COLOR_SCORE)
+    love.graphics.print("SCORE: " .. score, 10, 10)
+    
+    -- Tiempo con sombra
+    local minutes = math.floor(gameTime / 60)
+    local seconds = math.floor(gameTime % 60)
+    local timeText = string.format("TIME: %02d:%02d", minutes, seconds)
+    
+    love.graphics.setColor(0, 0, 0, 0.8)
+    love.graphics.print(timeText, 12, 37)
+    love.graphics.setColor(1, 1, 1, 0.9)
+    love.graphics.print(timeText, 10, 35)
+    
+    -- Enemigos activos con sombra
+    local activeEnemies, _, _ = enemyPool:getStats()
+    local enemyText = "ENEMIES: " .. activeEnemies
+    local enemyColor = activeEnemies > 80 and {1, 0.3, 0.3, 1} or {1, 0.8, 0.2, 1}
+    
+    love.graphics.setColor(0, 0, 0, 0.8)
+    love.graphics.print(enemyText, 12, 62)
+    love.graphics.setColor(enemyColor)
+    love.graphics.print(enemyText, 10, 60)
+    
+    -- Indicador de música (esquina inferior izquierda)
+    love.graphics.setFont(fonts.small)
+    if Audio:isMusicPlaying() then
+        love.graphics.setColor(0.5, 1, 0.5, 0.6)
+        love.graphics.print("[M] Music ON", 10, Constants.WINDOW_HEIGHT - 25)
+    else
+        love.graphics.setColor(1, 0.5, 0.5, 0.6)
+        love.graphics.print("[M] Music OFF", 10, Constants.WINDOW_HEIGHT - 25)
+    end
+    
+    -- Spawn rate (esquina inferior derecha)
+    love.graphics.setColor(1, 1, 1, 0.3)
+    local rate = string.format("Spawn: %.2fs", spawner:getCurrentRate())
+    love.graphics.print(rate, Constants.WINDOW_WIDTH - fonts.small:getWidth(rate) - 10, Constants.WINDOW_HEIGHT - 25)
+    
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
+function drawCrosshair()
+    local mx, my = love.mouse.getPosition()
+    local size = 12
+    local innerSize = 4
+    local time = love.timer.getTime()
+    
+    -- Rotación sutil
+    love.graphics.push()
+    love.graphics.translate(mx, my)
+    love.graphics.rotate(time * 0.5)
+    
+    -- Cruz exterior
+    love.graphics.setColor(1, 0.2, 0.2, 0.6)
+    love.graphics.setLineWidth(2)
+    love.graphics.line(-size, 0, -innerSize, 0)
+    love.graphics.line(innerSize, 0, size, 0)
+    love.graphics.line(0, -size, 0, -innerSize)
+    love.graphics.line(0, innerSize, 0, size)
+    
+    love.graphics.pop()
+    
+    -- Círculo central
+    love.graphics.setColor(1, 0.2, 0.2, 0.8)
+    love.graphics.circle("line", mx, my, innerSize)
+    
+    -- Punto central
+    love.graphics.setColor(1, 0.4, 0.4, 1)
+    love.graphics.circle("fill", mx, my, 2)
+    
+    love.graphics.setLineWidth(1)
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
+function drawDebugOverlay()
+    if not (debugFlags.showFPS or debugFlags.showEntities) then
+        return
+    end
+    
+    local y = 10
+    local x = Constants.WINDOW_WIDTH - 150
+    
+    love.graphics.setColor(0, 0, 0, 0.7)
+    love.graphics.rectangle("fill", x - 5, y - 5, 150, 
+        (debugFlags.showFPS and debugFlags.showEntities) and 120 or 60)
+    
+    love.graphics.setColor(Constants.DEBUG_COLOR)
+    
+    if debugFlags.showFPS then
+        love.graphics.print("FPS: " .. love.timer.getFPS(), x, y)
+        y = y + 15
         
-        if p.life <= 0 then
-            table.remove(particles, i)
+        local stats = love.graphics.getStats()
+        love.graphics.print("Draw calls: " .. stats.drawcalls, x, y)
+        y = y + 15
+        
+        if crtShader then
+            love.graphics.print("CRT: " .. crtShader:getStatus(), x, y)
+            y = y + 15
         end
     end
-end
-
-function drawParticles()
-    for _, p in ipairs(particles) do
-        love.graphics.setColor(p.r, p.g, p.b, p.alpha)
-        love.graphics.rectangle("fill", p.x, p.y, p.size, p.size)
-    end
-end
-
--- ========================================
--- utils.lua (integrado)
--- ========================================
-
-function checkCollision(a, b)
-    local aSize = a.size or a.width or 0
-    local bSize = b.size or b.width or 0
     
-    return a.x < b.x + bSize and
-           a.x + aSize > b.x and
-           a.y < b.y + bSize and
-           a.y + aSize > b.y
+    if debugFlags.showEntities then
+        local bullets, bulletTotal, _ = bulletPool:getStats()
+        local enemies, enemyTotal, _ = enemyPool:getStats()
+        local particles, particleTotal, _ = particlePool:getStats()
+        
+        love.graphics.print(string.format("Bullets: %d/%d", bullets, bulletTotal), x, y)
+        y = y + 15
+        love.graphics.print(string.format("Enemies: %d/%d", enemies, enemyTotal), x, y)
+        y = y + 15
+        love.graphics.print(string.format("Particles: %d/%d", particles, particleTotal), x, y)
+    end
+    
+    love.graphics.setColor(1, 1, 1, 1)
 end
