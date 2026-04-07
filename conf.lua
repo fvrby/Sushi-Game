@@ -41,6 +41,6 @@ function love.conf(t)
     t.modules.thread = false            -- No usado: single-threaded
     t.modules.timer = true              -- Necesario: delta time
     t.modules.touch = false             -- No usado: desktop only
-    t.modules.video = false             -- No usado: no video playback
+    t.modules.video = true              -- Necesario: video de victoria
     t.modules.window = true             -- Necesario: ventana
 end

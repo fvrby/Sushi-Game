@@ -30,7 +30,11 @@ local Pool = require("src.core.pool")
 local Player = require("src.entities.player")
 local Bullet = require("src.entities.bullet")
 local Enemy = require("src.entities.enemy")
+local ErraticEnemy = require("src.entities.erratic_enemy")
 local Particle = require("src.entities.particle")
+local PowerUp = require("src.entities.powerup")
+local Boss = require("src.entities.boss")
+local BossBullet = require("src.entities.boss_bullet")
 
 local Spawner = require("src.systems.spawner")
 local Collision = require("src.systems.collision")
@@ -44,10 +48,26 @@ local CRTShader = require("src.rendering.crt_shader")
 local player
 local bulletPool
 local enemyPool
+local erraticEnemyPool
 local particlePool
+local powerupPool
+local boss
+local bossBulletPool
 local spawner
 local collision
 local crtShader
+
+local nextBossScore = 0   -- Umbral de puntos para el siguiente jefe
+
+-- Explosión gradual del jefe tras su muerte
+local bossDeathX         = 0
+local bossDeathY         = 0
+local bossExplosionTimer = 0   -- Tiempo restante de explosión
+local bossExplosionTick  = 0   -- Timer entre ráfagas de partículas
+local BOSS_EXPLOSION_INTERVAL = 0.18
+
+-- Video de victoria
+local victoryVideo = nil
 
 local score = 0
 local gameTime = 0
@@ -93,18 +113,28 @@ end
 local function resetGame()
     -- Reset player
     player:reset()
-    
+
     -- Liberar todas las entidades
     bulletPool:releaseAll()
     enemyPool:releaseAll()
+    erraticEnemyPool:releaseAll()
     particlePool:releaseAll()
-    
+    powerupPool:releaseAll()
+    bossBulletPool:releaseAll()
+
+    -- Desactivar jefe
+    boss.active = false
+
     -- Reset spawner
     spawner:reset()
-    
-    -- Reset score y tiempo
-    score = 0
-    gameTime = 0
+
+    -- Reset score, tiempo y umbral del jefe
+    score         = 0
+    gameTime      = 0
+    nextBossScore = Constants.BOSS_SCORE_INTERVAL
+
+    -- Volver a la música principal
+    Audio:playMusic("main")
 end
 
 -- =============================================================================
@@ -129,12 +159,18 @@ function love.load()
     player = Player:new()
     
     -- Crear pools
-    bulletPool = Pool:new(Bullet, Constants.BULLET_POOL_SIZE)
-    enemyPool = Pool:new(Enemy, Constants.ENEMY_POOL_SIZE)
-    particlePool = Pool:new(Particle, Constants.PARTICLE_POOL_SIZE)
-    
+    bulletPool       = Pool:new(Bullet, Constants.BULLET_POOL_SIZE)
+    enemyPool        = Pool:new(Enemy, Constants.ENEMY_POOL_SIZE)
+    erraticEnemyPool = Pool:new(ErraticEnemy, Constants.ERRATIC_ENEMY_POOL_SIZE)
+    particlePool     = Pool:new(Particle, Constants.PARTICLE_POOL_SIZE)
+    powerupPool      = Pool:new(PowerUp, Constants.POWERUP_POOL_SIZE)
+    bossBulletPool   = Pool:new(BossBullet, Constants.BOSS_BULLET_POOL_SIZE)
+
+    -- Crear jefe (singleton, inactivo al inicio)
+    boss = Boss:new()
+
     -- Crear sistemas
-    spawner = Spawner:new(enemyPool)
+    spawner = Spawner:new(enemyPool, erraticEnemyPool)
     collision = Collision:new()
     
     -- Configurar callbacks de colisión
@@ -160,10 +196,18 @@ function love.load()
             Constants.PARTICLE_SPEED_MIN,
             Constants.PARTICLE_SPEED_MAX
         )
-        
+
+        -- Drop de power-up (solo si el enemigo era portador)
+        if enemy.hasPowerUp then
+            local pu = powerupPool:get()
+            if pu then
+                pu:activate(cx, cy, "spread")
+            end
+        end
+
         -- Score
         score = score + Constants.SCORE_PER_KILL
-        
+
         -- Sonido
         Audio:playSFX("explosion")
     end
@@ -186,7 +230,13 @@ function love.load()
     
     -- Crear shader CRT
     crtShader = CRTShader:new()
-    
+
+    -- Cargar video de victoria (requiere formato .ogv)
+    local ok, vid = pcall(function()
+        return love.graphics.newVideo("assets/video/FFVII-ChocoboDance.ogv")
+    end)
+    if ok then victoryVideo = vid end
+
     -- Iniciar en menú
     GameState:switch("menu")
 end
@@ -571,26 +621,196 @@ function registerStates()
             
             -- Disparar
             if shouldFire then
-                local bullet = bulletPool:get()
-                if bullet then
-                    local x, y, dx, dy = player:getFireData()
-                    bullet:activate(x, y, dx, dy)
-                    Audio:playSFX("shoot")
+                local x, y, dx, dy = player:getFireData()
+                local baseAngle   = math.atan2(dy, dx)
+                local bulletCount = player.spreadActive and Constants.SPREAD_SHOT_BULLETS or 1
+                local totalArc    = player.spreadActive and Constants.SPREAD_SHOT_ANGLE or 0
+
+                for i = 1, bulletCount do
+                    local angle
+                    if bulletCount == 1 then
+                        angle = baseAngle
+                    else
+                        local t = (i - 1) / (bulletCount - 1)   -- 0..1
+                        angle = baseAngle - totalArc / 2 + t * totalArc
+                    end
+                    local bullet = bulletPool:get()
+                    if bullet then
+                        bullet:activate(x, y, math.cos(angle), math.sin(angle))
+                    end
                 end
+                Audio:playSFX("shoot")
             end
-            
-            -- Spawn enemies
-            spawner:update(dt)
-            
-            -- Update enemies
+
+            -- Spawn enemies (pausado mientras el jefe esté activo)
+            if not boss.active then
+                spawner:update(dt)
+            end
+
+            -- Update enemies normales
             for _, enemy in enemyPool:iterateActive() do
                 enemy:update(dt, player.x, player.y)
             end
+
+            -- Update enemies erráticos
+            for _, enemy in erraticEnemyPool:iterateActive() do
+                enemy:update(dt, player.x, player.y)
+            end
+
+            -- Update power-ups y colisión con jugador
+            for _, pu in powerupPool:iterateActive() do
+                if not pu:update(dt) then
+                    powerupPool:release(pu)
+                elseif pu:isCollectedBy(player.x, player.y) then
+                    player:activateSpread(Constants.SPREAD_SHOT_DURATION)
+                    local cx, cy = pu:getCenter()
+                    spawnParticles(cx, cy, 12, Constants.COLOR_POWERUP_SPREAD, 80, 200)
+                    powerupPool:release(pu)
+                end
+            end
             
-            -- Update bullets
+            -- Spawn del jefe al llegar al umbral de puntos
+            if not boss.active and score >= nextBossScore then
+                -- Eliminar todos los enemigos y power-ups antes de spawnear al jefe
+                for _, enemy in enemyPool:iterateActive() do
+                    local cx, cy = enemy:getCenter()
+                    spawnParticles(cx, cy, 8, Constants.COLOR_PARTICLE_DEATH, 40, 120)
+                    enemyPool:release(enemy)
+                end
+                for _, enemy in erraticEnemyPool:iterateActive() do
+                    local cx, cy = enemy:getCenter()
+                    spawnParticles(cx, cy, 8, Constants.COLOR_ERRATIC_ENEMY, 40, 120)
+                    erraticEnemyPool:release(enemy)
+                end
+                powerupPool:releaseAll()
+
+                boss:spawn()
+                nextBossScore = nextBossScore + Constants.BOSS_SCORE_INTERVAL
+                Audio:playMusic("boss")
+            end
+
+            -- Update jefe (incluyendo estados de muerte)
+            if boss.active then
+                local bossAction = boss:update(dt, player.x, player.y)
+
+                if bossAction == "death_explode" then
+                    -- Ráfaga inicial de la explosión
+                    spawnParticles(boss.x, boss.y, 40, Constants.COLOR_BOSS, 150, 420)
+                    spawnParticles(boss.x, boss.y, 20, {1, 0.85, 0.2, 1}, 80, 250)
+                    bossBulletPool:releaseAll()
+                    Audio:playSFX("explosion")
+                    -- Arrancar explosión gradual durante BOSS_DEATH_WAIT_DURATION segundos
+                    bossDeathX         = boss.x
+                    bossDeathY         = boss.y
+                    bossExplosionTimer = Constants.BOSS_DEATH_WAIT_DURATION
+                    bossExplosionTick  = 0
+
+                elseif bossAction == "death_complete" then
+                    GameState:switch("victory")
+
+                elseif type(bossAction) == "table" then
+
+                    if bossAction.mode == "normal" then
+                        local bx, by, bdx, bdy = boss:getFireData(bossAction.tx, bossAction.ty)
+                        local bb = bossBulletPool:get()
+                        if bb then bb:activate(bx, by, bdx, bdy) end
+                        Audio:playSFX("shoot")
+
+                    elseif bossAction.mode == "burst" then
+                        local ang = bossAction.angle
+                        local bx  = boss.x + math.cos(ang) * (boss.radius + 5)
+                        local by  = boss.y + math.sin(ang) * (boss.radius + 5)
+                        local bb  = bossBulletPool:get()
+                        if bb then bb:activate(bx, by, math.cos(ang), math.sin(ang)) end
+
+                    elseif bossAction.mode == "arc" then
+                        local _, _, bdx, bdy = boss:getFireData(bossAction.tx, bossAction.ty)
+                        local baseAngle = math.atan2(bdy, bdx)
+                        local bsx = boss.x + bdx * (boss.radius + 5)
+                        local bsy = boss.y + bdy * (boss.radius + 5)
+                        local n   = Constants.BOSS_ARC_BULLETS
+                        local arc = Constants.BOSS_ARC_ANGLE
+                        for i = 1, n do
+                            local t   = (i - 1) / (n - 1)
+                            local ang = baseAngle - arc / 2 + t * arc
+                            local bb  = bossBulletPool:get()
+                            if bb then bb:activate(bsx, bsy, math.cos(ang), math.sin(ang)) end
+                        end
+                        Audio:playSFX("shoot")
+
+                    elseif bossAction.mode == "bomb" then
+                        local bx, by, bdx, bdy = boss:getFireData(bossAction.tx, bossAction.ty)
+                        local bb = bossBulletPool:get()
+                        if bb then
+                            bb:activate(bx, by, bdx, bdy)
+                            bb.radius    = Constants.BOSS_BOMB_RADIUS
+                            bb.width     = bb.radius * 2
+                            bb.height    = bb.radius * 2
+                            bb.speed     = Constants.BOSS_BOMB_SPEED
+                            bb.isBomb    = true
+                            bb.explodeAt = Constants.BOSS_BOMB_EXPLODE_DIST
+                        end
+                        Audio:playSFX("shoot")
+                    end
+                end
+
+                -- Colisión jefe ↔ jugador
+                if boss:collidesWithPlayer(player) then
+                    player:die()
+                    GameState:switch("gameover")
+                end
+
+                -- Explosión gradual (durante dying_wait)
+                if bossExplosionTimer > 0 then
+                    bossExplosionTimer = bossExplosionTimer - dt
+                    bossExplosionTick  = bossExplosionTick  - dt
+                    if bossExplosionTick <= 0 then
+                        bossExplosionTick = BOSS_EXPLOSION_INTERVAL
+                        spawnParticles(bossDeathX, bossDeathY, 10, Constants.COLOR_BOSS, 100, 320)
+                        spawnParticles(bossDeathX, bossDeathY,  5, {1, 0.85, 0.2, 1}, 60, 180)
+                        Audio:playSFX("explosion")
+                    end
+                end
+            end
+
+            -- Update balas del jugador (+ colisión con jefe)
             for _, bullet in bulletPool:iterateActive() do
                 if not bullet:update(dt) then
                     bulletPool:release(bullet)
+                elseif boss.active and boss:collidesWithBullet(bullet) then
+                    bulletPool:release(bullet)
+                    if boss:takeDamage(bullet.damage) then
+                        boss:startDying()
+                        Audio:playMusic("winsound")
+                    end
+                end
+            end
+
+            -- Update balas del jefe (normal + bomba + perdigones)
+            for _, bb in bossBulletPool:iterateActive() do
+                local result = bb:update(dt)
+                if result == "explode" then
+                    -- La bomba detona: crear perdigones en 8 direcciones
+                    local bx, by = bb.x, bb.y
+                    spawnParticles(bx, by, 16, Constants.COLOR_BOSS_BULLET, 80, 220)
+                    for i = 1, Constants.BOSS_PELLET_COUNT do
+                        local ang    = (i - 1) / Constants.BOSS_PELLET_COUNT * math.pi * 2
+                        local pellet = bossBulletPool:get()
+                        if pellet then
+                            pellet:activate(bx, by, math.cos(ang), math.sin(ang))
+                            pellet.radius = Constants.BOSS_PELLET_RADIUS
+                            pellet.width  = pellet.radius * 2
+                            pellet.height = pellet.radius * 2
+                            pellet.speed  = Constants.BOSS_PELLET_SPEED
+                        end
+                    end
+                    bossBulletPool:release(bb)
+                elseif result == false then
+                    bossBulletPool:release(bb)
+                elseif bb:collidesWithPlayer(player) then
+                    bossBulletPool:release(bb)
+                    player:die()
+                    GameState:switch("gameover")
                 end
             end
             
@@ -601,8 +821,9 @@ function registerStates()
                 end
             end
             
-            -- Collision detection
+            -- Collision detection (normales + erráticos)
             collision:update(player, bulletPool, enemyPool)
+            collision:update(player, bulletPool, erraticEnemyPool)
         end,
         
         draw = function(self)
@@ -614,22 +835,48 @@ function registerStates()
                 particle:draw()
             end
             
-            -- Enemies
+            -- Power-ups (debajo de los enemigos)
+            for _, pu in powerupPool:iterateActive() do
+                pu:draw()
+            end
+
+            -- Enemies normales
             for _, enemy in enemyPool:iterateActive() do
                 enemy:draw()
                 if debugFlags.showHitboxes then
                     enemy:drawDebug()
                 end
             end
+
+            -- Enemies erráticos
+            for _, enemy in erraticEnemyPool:iterateActive() do
+                enemy:draw()
+                if debugFlags.showHitboxes then
+                    enemy:drawDebug()
+                end
+            end
             
-            -- Bullets
+            -- Balas del jugador
             for _, bullet in bulletPool:iterateActive() do
                 bullet:draw()
                 if debugFlags.showHitboxes then
                     bullet:drawDebug()
                 end
             end
-            
+
+            -- Jefe
+            if boss.active then
+                boss:draw()
+            end
+
+            -- Balas del jefe
+            for _, bb in bossBulletPool:iterateActive() do
+                bb:draw()
+                if debugFlags.showHitboxes then
+                    bb:drawDebug()
+                end
+            end
+
             -- Player
             player:draw()
             if debugFlags.showHitboxes then
@@ -680,11 +927,18 @@ function registerStates()
             for _, enemy in enemyPool:iterateActive() do
                 enemy:draw()
             end
-            
+
+            for _, enemy in erraticEnemyPool:iterateActive() do
+                enemy:draw()
+            end
+
             for _, bullet in bulletPool:iterateActive() do
                 bullet:draw()
             end
-            
+
+            if boss.active then boss:draw() end
+            for _, bb in bossBulletPool:iterateActive() do bb:draw() end
+
             -- Overlay oscuro
             love.graphics.setColor(0, 0, 0, 0.75)
             love.graphics.rectangle("fill", 0, 0, 
@@ -760,6 +1014,108 @@ function registerStates()
             end
         end,
     })
+
+    -- =========================================================================
+    -- VICTORY STATE
+    -- =========================================================================
+    GameState:register("victory", {
+        enter = function(self)
+            love.mouse.setVisible(true)
+            if victoryVideo then
+                victoryVideo:rewind()
+                victoryVideo:play()
+            end
+        end,
+
+        draw = function(self)
+            -- Fondo: video si está disponible, sino grid
+            if victoryVideo then
+                local vw = victoryVideo:getWidth()
+                local vh = victoryVideo:getHeight()
+                love.graphics.setColor(1, 1, 1, 1)
+                love.graphics.draw(
+                    victoryVideo, 0, 0, 0,
+                    Constants.WINDOW_WIDTH  / vw,
+                    Constants.WINDOW_HEIGHT / vh
+                )
+            else
+                drawBackgroundGrid()
+                for _, particle in particlePool:iterateActive() do particle:draw() end
+                for _, enemy   in enemyPool:iterateActive()    do enemy:draw()    end
+                for _, enemy   in erraticEnemyPool:iterateActive() do enemy:draw() end
+                for _, bullet  in bulletPool:iterateActive()   do bullet:draw()   end
+                player:draw()
+            end
+
+            -- Overlay oscuro dorado
+            love.graphics.setColor(0.05, 0.05, 0, 0.72)
+            love.graphics.rectangle("fill", 0, 0,
+                Constants.WINDOW_WIDTH, Constants.WINDOW_HEIGHT)
+
+            -- Panel
+            local panelW = 520
+            local panelH = 250
+            local panelX = (Constants.WINDOW_WIDTH  - panelW) / 2
+            local panelY = (Constants.WINDOW_HEIGHT - panelH) / 2
+
+            love.graphics.setColor(0.06, 0.06, 0.05, 0.96)
+            love.graphics.rectangle("fill", panelX, panelY, panelW, panelH, 8, 8)
+
+            love.graphics.setColor(1, 0.8, 0.1, 1)
+            love.graphics.setLineWidth(3)
+            love.graphics.rectangle("line", panelX, panelY, panelW, panelH, 8, 8)
+            love.graphics.setLineWidth(1)
+
+            -- Título "VICTORIA" pulsante en dorado
+            local time  = love.timer.getTime()
+            local pulse = 0.85 + 0.15 * math.sin(time * 3)
+            love.graphics.setFont(fonts.title)
+            love.graphics.setColor(1 * pulse, 0.8 * pulse, 0.1 * pulse, 1)
+            local vText  = "VICTORIA"
+            local vWidth = fonts.title:getWidth(vText)
+            love.graphics.print(vText,
+                Constants.WINDOW_WIDTH / 2 - vWidth / 2,
+                panelY + 22)
+
+            -- Subtítulo
+            love.graphics.setFont(fonts.medium)
+            love.graphics.setColor(1, 1, 1, 0.9)
+            local sub      = "Sushiminis ha ganado..."
+            local subWidth = fonts.medium:getWidth(sub)
+            love.graphics.print(sub,
+                Constants.WINDOW_WIDTH / 2 - subWidth / 2,
+                panelY + 92)
+
+            -- Score
+            love.graphics.setFont(fonts.large)
+            love.graphics.setColor(Constants.COLOR_SCORE)
+            local st    = "PUNTUACION: " .. score
+            local stW   = fonts.large:getWidth(st)
+            love.graphics.print(st,
+                Constants.WINDOW_WIDTH / 2 - stW / 2,
+                panelY + 130)
+
+            -- Instrucciones
+            love.graphics.setFont(fonts.small)
+            love.graphics.setColor(1, 1, 1, 0.7)
+            local r1   = "R: Jugar de nuevo    ESC: Menu"
+            local r1W  = fonts.small:getWidth(r1)
+            love.graphics.print(r1,
+                Constants.WINDOW_WIDTH / 2 - r1W / 2,
+                panelY + 210)
+
+            love.graphics.setColor(1, 1, 1, 1)
+        end,
+
+        keypressed = function(self, key)
+            if Input:isAction(key, "restart") then
+                resetGame()
+                GameState:switch("playing")
+            elseif Input:isAction(key, "cancel") then
+                GameState:switch("menu")
+            end
+        end,
+    })
 end
 
 -- =============================================================================
@@ -821,11 +1177,69 @@ function drawHUD()
         love.graphics.print("[M] Music OFF", 10, Constants.WINDOW_HEIGHT - 25)
     end
     
+    -- Barra de vida del jefe (centro superior)
+    if boss and boss.active then
+        local barW  = 500
+        local barH  = 18
+        local barX  = (Constants.WINDOW_WIDTH - barW) / 2
+        local barY  = 8
+        local pct   = boss.health / boss.maxHealth
+
+        -- Fondo oscuro
+        love.graphics.setColor(0.1, 0.1, 0.15, 0.9)
+        love.graphics.rectangle("fill", barX, barY, barW, barH, 4, 4)
+
+        -- Relleno rojo
+        love.graphics.setColor(Constants.COLOR_BOSS_HEALTHBAR)
+        love.graphics.rectangle("fill", barX, barY, barW * pct, barH, 4, 4)
+
+        -- Borde
+        love.graphics.setColor(1, 0.3, 0.3, 1)
+        love.graphics.setLineWidth(2)
+        love.graphics.rectangle("line", barX, barY, barW, barH, 4, 4)
+        love.graphics.setLineWidth(1)
+
+        -- Marcadores de fase (líneas blancas en los umbrales 80/60/40/20%)
+        love.graphics.setColor(1, 1, 1, 0.65)
+        love.graphics.setLineWidth(2)
+        local phaseThresholds = {
+            Constants.BOSS_PHASE2_HP / Constants.BOSS_HEALTH,
+            Constants.BOSS_PHASE3_HP / Constants.BOSS_HEALTH,
+            Constants.BOSS_PHASE4_HP / Constants.BOSS_HEALTH,
+            Constants.BOSS_PHASE5_HP / Constants.BOSS_HEALTH,
+        }
+        for _, t in ipairs(phaseThresholds) do
+            local mx = barX + barW * t
+            love.graphics.line(mx, barY + 2, mx, barY + barH - 2)
+        end
+        love.graphics.setLineWidth(1)
+
+        -- Etiqueta centrada dentro de la barra
+        love.graphics.setFont(fonts.small)
+        love.graphics.setColor(1, 1, 1, 1)
+        local bPhase   = boss:getPhase()
+        local label    = string.format("JEFE  %d / %d   [Fase %d]", boss.health, boss.maxHealth, bPhase)
+        local labelW   = fonts.small:getWidth(label)
+        love.graphics.print(label, Constants.WINDOW_WIDTH / 2 - labelW / 2, barY + 2)
+    end
+
+    -- Spread shot activo (centro superior, debajo de la barra del jefe si aplica)
+    if player.spreadActive then
+        local c    = Constants.COLOR_POWERUP_SPREAD
+        local pulse = 0.7 + 0.3 * math.sin(love.timer.getTime() * 6)
+        love.graphics.setFont(fonts.small)
+        love.graphics.setColor(c[1] * pulse, c[2] * pulse, c[3] * pulse, 1)
+        local spreadText = string.format("[ SPREAD SHOT  %.1fs ]", player.spreadTimer)
+        local sw   = fonts.small:getWidth(spreadText)
+        local syOffset = (boss and boss.active) and 34 or 10
+        love.graphics.print(spreadText, Constants.WINDOW_WIDTH / 2 - sw / 2, syOffset)
+    end
+
     -- Spawn rate (esquina inferior derecha)
     love.graphics.setColor(1, 1, 1, 0.3)
     local rate = string.format("Spawn: %.2fs", spawner:getCurrentRate())
     love.graphics.print(rate, Constants.WINDOW_WIDTH - fonts.small:getWidth(rate) - 10, Constants.WINDOW_HEIGHT - 25)
-    
+
     love.graphics.setColor(1, 1, 1, 1)
 end
 

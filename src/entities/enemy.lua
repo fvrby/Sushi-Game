@@ -34,8 +34,9 @@ function Enemy:new()
     enemy.maxHealth = Constants.ENEMY_HEALTH
     
     -- Visual
-    enemy.hitFlash = 0  -- Timer para flash al recibir daño
-    
+    enemy.hitFlash  = 0   -- Timer para flash al recibir daño
+    enemy.hasPowerUp = false  -- Portador de power-up (brillo arcoiris)
+
     return enemy
 end
 
@@ -53,9 +54,10 @@ function Enemy:activate(x, y)
         Constants.ENEMY_SPEED_MAX
     )
     
-    -- Reset vida
-    self.health = self.maxHealth
-    self.hitFlash = 0
+    -- Reset vida y estado
+    self.health     = self.maxHealth
+    self.hitFlash   = 0
+    self.hasPowerUp = false
 end
 
 --[[
@@ -134,13 +136,36 @@ function Enemy:getCenter()
 end
 
 --[[
+    Brillo arcoiris para portadores de power-up
+]]
+function Enemy:drawRainbowGlow()
+    if not self.hasPowerUp then return end
+
+    local cx, cy  = self:getCenter()
+    local t       = love.timer.getTime() * 2.5
+    local r = 0.5 + 0.5 * math.sin(t)
+    local g = 0.5 + 0.5 * math.sin(t + 2.094)   -- +120°
+    local b = 0.5 + 0.5 * math.sin(t + 4.189)   -- +240°
+    local glowR = math.max(self.width, self.height) / 2 + 9
+
+    love.graphics.setColor(r, g, b, 0.65)
+    love.graphics.circle("fill", cx, cy, glowR)
+    -- Anillo exterior más sutil
+    love.graphics.setColor(r, g, b, 0.25)
+    love.graphics.circle("fill", cx, cy, glowR + 5)
+end
+
+--[[
     Dibujar el enemigo
 ]]
 function Enemy:draw()
     if not self.active then
         return
     end
-    
+
+    -- Brillo arcoiris si es portador de power-up
+    self:drawRainbowGlow()
+
     -- Color base o flash
     local color
     if self.hitFlash > 0 then

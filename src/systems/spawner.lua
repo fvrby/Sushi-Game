@@ -14,17 +14,19 @@ Spawner.__index = Spawner
 
 --[[
     Constructor
-    
-    @param enemyPool - Pool de enemigos
+
+    @param enemyPool        - Pool de enemigos normales
+    @param erraticEnemyPool - Pool de enemigos erráticos (opcional)
     @return Spawner instance
 ]]
-function Spawner:new(enemyPool)
+function Spawner:new(enemyPool, erraticEnemyPool)
     local spawner = setmetatable({}, Spawner)
-    
-    spawner.enemyPool = enemyPool
+
+    spawner.enemyPool        = enemyPool
+    spawner.erraticEnemyPool = erraticEnemyPool  -- puede ser nil
     spawner.spawnRate = Constants.SPAWN_RATE_INITIAL
     spawner.spawnTimer = 0
-    
+
     return spawner
 end
 
@@ -65,20 +67,30 @@ function Spawner:update(dt)
 end
 
 --[[
-    Spawn un enemigo desde un borde aleatorio
-    
+    Spawn un enemigo desde un borde aleatorio.
+    Con probabilidad ERRATIC_SPAWN_CHANCE elige un enemigo errático.
+
     @return boolean - true si se spawneó, false si pool lleno
 ]]
 function Spawner:spawnEnemy()
-    local enemy = self.enemyPool:get()
-    
+    local useErratic = self.erraticEnemyPool and
+                       love.math.random() < Constants.ERRATIC_SPAWN_CHANCE
+
+    local pool = useErratic and self.erraticEnemyPool or self.enemyPool
+    local enemy = pool:get()
+
     if not enemy then
-        return false    -- Pool agotado
+        return false
     end
-    
+
     local x, y = self:getSpawnPosition()
     enemy:activate(x, y)
-    
+
+    -- Marcar como portador de power-up (brillo arcoiris)
+    if love.math.random() < Constants.POWERUP_DROP_CHANCE then
+        enemy.hasPowerUp = true
+    end
+
     return true
 end
 

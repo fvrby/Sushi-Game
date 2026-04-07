@@ -39,7 +39,9 @@ Audio.sfxExplosionVolume = Constants.SFX_EXPLOSION_VOLUME_DEFAULT
 ]]
 function Audio:init()
     -- Cargar música
-    self:loadMusic("main", "assets/audio/music/Sushi_Game_OST_Armageddon.mp3")
+    self:loadMusic("main",     "assets/audio/music/Train-to-limache.mp3")
+    self:loadMusic("boss",     "assets/audio/music/SMB2-BOSS-THEME.mp3")
+    self:loadMusic("winsound", "assets/audio/music/SMW-WinSound.mp3", false)  -- sin loop
     
     -- Cargar SFX
     self:loadSFX("shoot", "assets/audio/sfx/pistol-shot.wav")
@@ -52,13 +54,17 @@ end
     @param name - Identificador
     @param path - Ruta al archivo
 ]]
-function Audio:loadMusic(name, path)
+--[[
+    @param looping - boolean, default true
+]]
+function Audio:loadMusic(name, path, looping)
     local success, result = pcall(function()
         return love.audio.newSource(path, "stream")
     end)
-    
+
     if success then
-        result:setLooping(true)
+        if looping == nil then looping = true end
+        result:setLooping(looping)
         result:setVolume(self.musicVolume)
         self.music[name] = result
     else
@@ -97,6 +103,7 @@ function Audio:playMusic(name)
     
     local music = self.music[name]
     if music then
+        music:seek(0)   -- Siempre reinicia desde el principio
         music:setVolume(self.musicVolume)
         music:play()
         self.currentMusic = music

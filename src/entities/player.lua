@@ -44,6 +44,10 @@ function Player:new()
     
     -- Estado
     player.alive = true
+
+    -- Spread shot power-up
+    player.spreadActive = false
+    player.spreadTimer  = 0
     
     -- Sprite (nil = usar dibujo geométrico)
     player.sprite = nil
@@ -74,6 +78,8 @@ function Player:reset()
     self.angle = 0
     self.fireCooldown = 0
     self.alive = true
+    self.spreadActive = false
+    self.spreadTimer  = 0
 end
 
 --[[
@@ -95,7 +101,16 @@ function Player:update(dt)
     
     -- Cooldown de disparo
     local shouldFire = self:updateFiring(dt)
-    
+
+    -- Actualizar timer del spread shot
+    if self.spreadActive then
+        self.spreadTimer = self.spreadTimer - dt
+        if self.spreadTimer <= 0 then
+            self.spreadActive = false
+            self.spreadTimer  = 0
+        end
+    end
+
     return shouldFire
 end
 
@@ -187,6 +202,16 @@ function Player:getBounds()
            self.y - self.height / 2,
            self.width,
            self.height
+end
+
+--[[
+    Activar spread shot
+
+    @param duration - Segundos que dura el poder
+]]
+function Player:activateSpread(duration)
+    self.spreadActive = true
+    self.spreadTimer  = duration
 end
 
 --[[
