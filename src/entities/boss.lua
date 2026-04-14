@@ -81,6 +81,11 @@ function Boss:new()
     boss.shakeX     = 0
     boss.shakeY     = 0
 
+    -- Sprite (nil = usar dibujo geométrico)
+    boss.sprite     = nil
+    local ok, img = pcall(love.graphics.newImage, "assets/images/boss.png")
+    if ok then boss.sprite = img end
+
     return boss
 end
 
@@ -387,15 +392,25 @@ function Boss:draw()
     love.graphics.circle("fill", drawX, drawY, self.radius * pulse + 10)
 
     -- Cuerpo principal
-    love.graphics.setColor(color)
-    love.graphics.circle("fill", drawX, drawY, self.radius * pulse)
+    if self.sprite then
+        local iw = self.sprite:getWidth()
+        local ih = self.sprite:getHeight()
+        local drawSize = self.radius * 2 * pulse * 3.2
+        local sx = drawSize / iw
+        local sy = drawSize / ih
+        love.graphics.setColor(color)
+        love.graphics.draw(self.sprite, drawX, drawY, 0, sx, sy, iw / 2, ih / 2)
+    else
+        love.graphics.setColor(color)
+        love.graphics.circle("fill", drawX, drawY, self.radius * pulse)
 
-    -- Highlight
-    love.graphics.setColor(1, 1, 1, 0.22)
-    love.graphics.circle("fill",
-        drawX - self.radius * 0.28,
-        drawY - self.radius * 0.28,
-        self.radius * 0.38)
+        -- Highlight
+        love.graphics.setColor(1, 1, 1, 0.22)
+        love.graphics.circle("fill",
+            drawX - self.radius * 0.28,
+            drawY - self.radius * 0.28,
+            self.radius * 0.38)
+    end
 
     love.graphics.setColor(1, 1, 1, 1)
 end

@@ -13,6 +13,12 @@ local Constants = require("src.core.constants")
 local Bullet = setmetatable({}, {__index = Entity})
 Bullet.__index = Bullet
 
+-- Sprite compartido por todas las instancias
+do
+    local ok, img = pcall(love.graphics.newImage, "assets/images/bullet.png")
+    Bullet.sharedSprite = ok and img or nil
+end
+
 --[[
     Constructor
     
@@ -33,7 +39,10 @@ function Bullet:new()
     
     -- Daño
     bullet.damage = Constants.BULLET_DAMAGE
-    
+
+    -- Rotación del shuriken
+    bullet.spinAngle = 0
+
     return bullet
 end
 
@@ -64,6 +73,9 @@ function Bullet:update(dt)
     -- Mover en dirección
     self.x = self.x + self.dx * self.speed * dt
     self.y = self.y + self.dy * self.speed * dt
+
+    -- Girar shuriken
+    self.spinAngle = self.spinAngle + 12 * dt
     
     -- Verificar límites de pantalla
     if self:isOutOfBounds() then
@@ -122,22 +134,30 @@ end
     Dibujar la bala
 ]]
 function Bullet:draw()
-    if not self.active then
-        return
+    if not self.active then return end
+
+    if Bullet.sharedSprite then
+        local iw = Bullet.sharedSprite:getWidth()
+        local ih = Bullet.sharedSprite:getHeight()
+        local drawSize = self.radius * 9
+        local sx = drawSize / iw
+        local sy = drawSize / ih
+        -- Glow
+        love.graphics.setColor(1, 0.85, 0.4, 0.3)
+        love.graphics.circle("fill", self.x, self.y, drawSize * 0.7)
+        -- Shuriken girando
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.draw(Bullet.sharedSprite, self.x, self.y, self.spinAngle, sx, sy, iw / 2, ih / 2)
+    else
+        -- Fallback geométrico
+        love.graphics.setColor(1, 1, 0.5, 0.3)
+        love.graphics.circle("fill", self.x, self.y, self.radius * 2)
+        love.graphics.setColor(Constants.COLOR_BULLET)
+        love.graphics.circle("fill", self.x, self.y, self.radius)
+        love.graphics.setColor(1, 1, 1, 0.8)
+        love.graphics.circle("fill", self.x - 1, self.y - 1, self.radius * 0.4)
     end
-    
-    -- Glow effect (círculo más grande, semi-transparente)
-    love.graphics.setColor(1, 1, 0.5, 0.3)
-    love.graphics.circle("fill", self.x, self.y, self.radius * 2)
-    
-    -- Bala principal
-    love.graphics.setColor(Constants.COLOR_BULLET)
-    love.graphics.circle("fill", self.x, self.y, self.radius)
-    
-    -- Highlight
-    love.graphics.setColor(1, 1, 1, 0.8)
-    love.graphics.circle("fill", self.x - 1, self.y - 1, self.radius * 0.4)
-    
+
     love.graphics.setColor(1, 1, 1, 1)
 end
 

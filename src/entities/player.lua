@@ -52,7 +52,10 @@ function Player:new()
     -- Sprite (nil = usar dibujo geométrico)
     player.sprite = nil
     player:loadSprite()
-    
+
+    -- Distancia de la pata al centro de Sushi
+    player.pawDistance = 28
+
     return player
 end
 
@@ -61,7 +64,7 @@ end
 ]]
 function Player:loadSprite()
     local success, result = pcall(function()
-        return love.graphics.newImage("assets/sprites/cat.png")
+        return love.graphics.newImage("assets/images/player.png")
     end)
     
     if success then
@@ -183,12 +186,11 @@ end
 function Player:getFireData()
     local dirX = math.cos(self.angle)
     local dirY = math.sin(self.angle)
-    
-    -- Spawn bala ligeramente enfrente del jugador
-    local spawnDistance = self.width / 2 + 5
-    local spawnX = self.x + dirX * spawnDistance
-    local spawnY = self.y + dirY * spawnDistance
-    
+
+    -- Las balas salen desde la pata
+    local spawnX = self.x + dirX * self.pawDistance
+    local spawnY = self.y + dirY * self.pawDistance
+
     return spawnX, spawnY, dirX, dirY
 end
 
@@ -240,17 +242,43 @@ end
     Dibujar usando sprite cargado
 ]]
 function Player:drawSprite()
-    local ox = self.sprite:getWidth() / 2
-    local oy = self.sprite:getHeight() / 2
-    
+    local iw = self.sprite:getWidth()
+    local ih = self.sprite:getHeight()
+    local drawSize = 128
+    local sx = drawSize / iw
+    local sy = drawSize / ih
+
+    -- Sushi estático (sin rotación)
     love.graphics.setColor(1, 1, 1, 1)
-    love.graphics.draw(
-        self.sprite,
-        self.x, self.y,
-        self.angle,
-        1, 1,
-        ox, oy
-    )
+    love.graphics.draw(self.sprite, self.x, self.y, 0, sx, sy, iw / 2, ih / 2)
+
+    -- Pata: círculo blanco orbitando hacia el mouse
+    local pawX = self.x + math.cos(self.angle) * self.pawDistance
+    local pawY = self.y + math.sin(self.angle) * self.pawDistance
+
+    -- Sombra suave de la pata
+    love.graphics.setColor(0, 0, 0, 0.2)
+    love.graphics.circle("fill", pawX + 2, pawY + 2, 9)
+
+    -- Pata principal
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.circle("fill", pawX, pawY, 9)
+
+    -- Deditos (3 círculos pequeños arriba)
+    love.graphics.setColor(1, 1, 1, 1)
+    for i = -1, 1 do
+        local dx = math.cos(self.angle + math.pi/2) * (i * 5)
+        local dy = math.sin(self.angle + math.pi/2) * (i * 5)
+        local tipX = pawX + math.cos(self.angle) * 7 + dx
+        local tipY = pawY + math.sin(self.angle) * 7 + dy
+        love.graphics.circle("fill", tipX, tipY, 3.5)
+    end
+
+    -- Almohadilla rosada
+    love.graphics.setColor(1, 0.7, 0.75, 1)
+    love.graphics.circle("fill", pawX, pawY, 4)
+
+    love.graphics.setColor(1, 1, 1, 1)
 end
 
 --[[
