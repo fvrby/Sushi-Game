@@ -39,6 +39,7 @@ local BossBullet = require("src.entities.boss_bullet")
 local Spawner = require("src.systems.spawner")
 local Collision = require("src.systems.collision")
 local Audio = require("src.core.audio")
+local Config = require("src.core.config")
 local UI = require("src.ui.ui_components")
 local CRTShader = require("src.rendering.crt_shader")
 
@@ -220,8 +221,11 @@ function love.load()
     -- Registrar estados
     registerStates()
     
-    -- Inicializar audio
-    Audio:init()
+    -- Cargar configuración guardada
+    Config:load()
+
+    -- Inicializar audio (aplica volúmenes guardados)
+    Audio:init(Config.data)
     Audio:playMusic("main")
     
     -- Crear UI de menú
@@ -256,6 +260,7 @@ function createMenuUI()
             buttonW, buttonH,
             "INICIAR",
             function()
+                Audio:playSFX("menu")
                 resetGame()
                 GameState:switch("playing")
             end,
@@ -266,6 +271,7 @@ function createMenuUI()
             buttonW, buttonH,
             "CONFIGURACION",
             function()
+                Audio:playSFX("menu")
                 GameState:switch("settings")
             end,
             Constants.COLOR_UI_SECONDARY
@@ -275,6 +281,7 @@ function createMenuUI()
             buttonW, buttonH,
             "SALIR",
             function()
+                Audio:playSFX("menu")
                 love.event.quit()
             end,
             {0.5, 0.5, 0.5}
@@ -298,6 +305,7 @@ function createSettingsUI()
             musicVol,
             function(value)
                 Audio:setMusicVolume(value)
+                Config:set("musicVolume", value)
             end,
             Constants.COLOR_UI_SECONDARY
         ),
@@ -308,6 +316,7 @@ function createSettingsUI()
             shootVol,
             function(value)
                 Audio:setShootVolume(value)
+                Config:set("sfxShootVolume", value)
                 Audio:playTestSound("shoot")
             end,
             {1, 0.8, 0.2}  -- Amarillo
@@ -319,6 +328,7 @@ function createSettingsUI()
             explosionVol,
             function(value)
                 Audio:setExplosionVolume(value)
+                Config:set("sfxExplosionVolume", value)
                 Audio:playTestSound("explosion")
             end,
             {1, 0.3, 0.3}  -- Rojo
@@ -331,6 +341,7 @@ function createSettingsUI()
             200, 50,
             "VOLVER",
             function()
+                Audio:playSFX("menu")
                 GameState:switch("menu")
             end,
             {0.5, 0.5, 0.5}

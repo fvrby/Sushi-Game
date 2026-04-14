@@ -37,15 +37,31 @@ Audio.sfxExplosionVolume = Constants.SFX_EXPLOSION_VOLUME_DEFAULT
     Carga todos los assets de audio.
     Usa pcall para evitar crashes si faltan archivos.
 ]]
-function Audio:init()
+--[[
+    Inicializar sistema de audio
+
+    @param savedConfig - tabla opcional con musicVolume, sfxShootVolume,
+                         sfxExplosionVolume (proveniente de Config.data)
+]]
+function Audio:init(savedConfig)
+    -- Aplicar volúmenes guardados si los hay
+    if savedConfig then
+        if savedConfig.musicVolume    then self.musicVolume    = savedConfig.musicVolume    end
+        if savedConfig.sfxShootVolume then self.sfxShootVolume = savedConfig.sfxShootVolume end
+        if savedConfig.sfxExplosionVolume then
+            self.sfxExplosionVolume = savedConfig.sfxExplosionVolume
+        end
+    end
+
     -- Cargar música
     self:loadMusic("main",     "assets/audio/music/Train-to-limache.mp3")
     self:loadMusic("boss",     "assets/audio/music/SMB2-BOSS-THEME.mp3")
     self:loadMusic("winsound", "assets/audio/music/SMW-WinSound.mp3", false)  -- sin loop
-    
+
     -- Cargar SFX
-    self:loadSFX("shoot", "assets/audio/sfx/pistol-shot.wav")
-    self:loadSFX("explosion", "assets/audio/sfx/Synthetic-explosion.wav")
+    self:loadSFX("shoot",     "assets/audio/sfx/bullet.wav")
+    self:loadSFX("explosion", "assets/audio/sfx/explosion.wav")
+    self:loadSFX("menu",      "assets/audio/sfx/Menu.wav")
 end
 
 --[[
@@ -159,6 +175,8 @@ function Audio:playSFX(name)
         volume = self.sfxShootVolume
     elseif name == "explosion" then
         volume = self.sfxExplosionVolume
+    elseif name == "menu" then
+        volume = 0.6
     end
     
     -- Clonar para permitir múltiples instancias simultáneas

@@ -14,6 +14,12 @@ local Constants = require("src.core.constants")
 local Enemy = setmetatable({}, {__index = Entity})
 Enemy.__index = Enemy
 
+-- Sprite compartido por todas las instancias (se carga una sola vez)
+do
+    local ok, img = pcall(love.graphics.newImage, "assets/images/enemy.png")
+    Enemy.sharedSprite = ok and img or nil
+end
+
 --[[
     Constructor
     
@@ -169,43 +175,37 @@ function Enemy:draw()
     -- Color base o flash
     local color
     if self.hitFlash > 0 then
-        color = {1, 1, 1, 1}    -- Blanco al recibir daño
+        color = {1, 1, 1, 1}
     else
         color = Constants.COLOR_ENEMY
     end
-    
-    -- Glow effect
-    love.graphics.setColor(color[1], color[2], color[3], 0.3)
-    love.graphics.rectangle(
-        "fill",
-        self.x - 4, self.y - 4,
-        self.width + 8, self.height + 8,
-        4, 4    -- Bordes redondeados
-    )
-    
-    -- Cuerpo principal
-    love.graphics.setColor(color)
-    love.graphics.rectangle(
-        "fill",
-        self.x, self.y,
-        self.width, self.height,
-        2, 2
-    )
-    
-    -- Highlight (esquina superior izquierda)
-    love.graphics.setColor(1, 1, 1, 0.3)
-    love.graphics.rectangle(
-        "fill",
-        self.x + 2, self.y + 2,
-        self.width * 0.3, self.height * 0.3,
-        1, 1
-    )
-    
+
+    local cx = self.x + self.width  / 2
+    local cy = self.y + self.height / 2
+
+    if Enemy.sharedSprite then
+        local iw = Enemy.sharedSprite:getWidth()
+        local ih = Enemy.sharedSprite:getHeight()
+        local drawSize = 72
+        local sx = drawSize / iw
+        local sy = drawSize / ih
+        love.graphics.setColor(color)
+        love.graphics.draw(Enemy.sharedSprite, cx, cy, 0, sx, sy, iw / 2, ih / 2)
+    else
+        -- Fallback geométrico
+        love.graphics.setColor(color[1], color[2], color[3], 0.3)
+        love.graphics.rectangle("fill", self.x - 4, self.y - 4, self.width + 8, self.height + 8, 4, 4)
+        love.graphics.setColor(color)
+        love.graphics.rectangle("fill", self.x, self.y, self.width, self.height, 2, 2)
+        love.graphics.setColor(1, 1, 1, 0.3)
+        love.graphics.rectangle("fill", self.x + 2, self.y + 2, self.width * 0.3, self.height * 0.3, 1, 1)
+    end
+
     -- Indicador de vida (solo si no está a full)
     if self.health < self.maxHealth then
         self:drawHealthBar()
     end
-    
+
     love.graphics.setColor(1, 1, 1, 1)
 end
 
